@@ -1,597 +1,500 @@
-# Jarvis
+<div align="center">
 
-**A 100% private AI voice assistant that lives on your computer** (works offline). Talk naturally as if Jarvis is a third person in the room — say its name anywhere in your sentence and get conversational, context-aware responses. It remembers everything, always knows the current location and time, can search the web, read your screen, control Chrome, track nutrition, and much more with support for unlimited MCPs and tools without context rot. Sensitive info is automatically redacted before anything is saved to disk.
+<img width="220" src="https://cdn-icons-png.flaticon.com/512/4712/4712109.png" />
 
-🔒 100% local processing. No subscriptions. No data harvesting. Automatic redaction of sensitive info. Free offline dictation included.
+# 🤖 JARVIS AI Assistant
+
+### Asistente de Inteligencia Artificial Privado, Local y Conversacional 🚀
+
+<p align="center">
+  <b>JARVIS AI Assistant</b> es un asistente inteligente completamente privado que funciona localmente en tu computadora, capaz de mantener conversaciones naturales, recordar información, controlar herramientas externas, realizar búsquedas web, automatizar tareas y ofrecer una experiencia similar a un asistente personal avanzado.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/AI-Assistant-blueviolet?style=for-the-badge">
+  <img src="https://img.shields.io/badge/Ollama-LocalAI-black?style=for-the-badge">
+  <img src="https://img.shields.io/badge/Whisper-SpeechRecognition-ff9800?style=for-the-badge">
+  <img src="https://img.shields.io/badge/MCP-Integrations-success?style=for-the-badge">
+</p>
+
+<p align="center">
+  <a href="#-acerca-del-proyecto">Acerca</a> •
+  <a href="#-características">Características</a> •
+  <a href="#-arquitectura">Arquitectura</a> •
+  <a href="#-instalación">Instalación</a> •
+  <a href="#-configuración">Configuración</a>
+</p>
+
+</div>
 
 ---
 
-**Support Jarvis** [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ff69b4?logo=github)](https://github.com/sponsors/isair) [![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-ff5722?logo=kofi&logoColor=white)](https://ko-fi.com/isair)
+# 🌌 Acerca del proyecto
+
+**JARVIS AI Assistant** es un asistente virtual impulsado por modelos de lenguaje ejecutados localmente, diseñado para ofrecer privacidad total, memoria persistente y automatización avanzada.
+
+A diferencia de asistentes tradicionales, Jarvis mantiene contexto conversacional, aprende preferencias del usuario y puede interactuar con herramientas externas mediante MCP (Model Context Protocol).
+
+La plataforma permite:
+
+* 🤖 Conversaciones inteligentes
+* 🎙️ Control por voz
+* 🧠 Memoria persistente
+* 🌐 Búsquedas web
+* 📂 Acceso a archivos
+* 📍 Conocimiento de ubicación y hora
+* 🛠️ Automatización de tareas
+* 🔒 Procesamiento completamente local
 
 ---
 
-<p align="center">
-  <img src="docs/img/face.png" alt="Jarvis Face" width="400">
+# ✨ Características
+
+## 🔒 Privacidad Total
+
+* Procesamiento local
+* Sin servidores externos
+* Sin suscripciones
+* Sin recopilación de datos
+* Redacción automática de información sensible
+
+---
+
+## 🧠 Memoria Inteligente
+
+* Recuerda conversaciones
+* Almacena preferencias
+* Grafo de conocimiento
+* Historial permanente
+* Recuperación contextual
+
+---
+
+## 🎙️ Interacción por Voz
+
+* Activación mediante palabra clave
+* Reconocimiento de voz con Whisper
+* Conversaciones naturales
+* Dictado offline
+* Respuestas habladas
+
+---
+
+## ⚡ Automatización
+
+* Control de navegador
+* Integración con aplicaciones
+* Automatización de tareas
+* Acciones contextuales
+* Herramientas personalizadas
+
+---
+
+# 🚀 Funcionalidades principales
+
+## 🗣️ Conversación Natural
+
+Jarvis entiende conversaciones completas y puede participar como si fuera una tercera persona dentro del diálogo.
+
+### Ejemplos
+
+* Consultas generales
+* Conversaciones técnicas
+* Ayuda en programación
+* Asistencia diaria
+* Resolución de problemas
+
+---
+
+## 🌐 Búsqueda Inteligente
+
+* Consultas web
+* Noticias
+* Información actualizada
+* Resultados contextuales
+* Respuestas enriquecidas
+
+---
+
+## 📂 Gestión de Archivos
+
+* Lectura de documentos
+* Acceso a carpetas
+* Búsqueda local
+* Organización de información
+
+---
+
+## 🍎 Seguimiento Personal
+
+* Registro nutricional
+* Objetivos de salud
+* Seguimiento de hábitos
+* Recomendaciones personalizadas
+
+---
+
+# 🧩 Arquitectura del sistema
+
+## 🤖 Motor de IA
+
+Encargado de comprender, procesar y responder solicitudes.
+
+### Componentes
+
+* Modelos LLM
+* Clasificación de intención
+* Memoria contextual
+* Generación de respuestas
+
+---
+
+## 🎤 Reconocimiento de voz
+
+Sistema basado en Whisper.
+
+### Funcionalidades
+
+* Conversión voz a texto
+* Detección de comandos
+* Filtrado de ruido
+* Procesamiento local
+
+---
+
+## 🔊 Síntesis de voz
+
+Generación de respuestas habladas.
+
+### Funcionalidades
+
+* Text-to-Speech
+* Voces naturales
+* Respuestas en tiempo real
+* Soporte multilenguaje
+
+---
+
+## 🔌 MCP Integration
+
+Sistema de conexión con herramientas externas.
+
+### Integraciones
+
+* GitHub
+* Google Workspace
+* Home Assistant
+* Slack
+* Discord
+* Bases de datos
+* APIs personalizadas
+
+---
+
+# 🛠️ Tecnologías utilizadas
+
+## 🤖 Inteligencia Artificial
+
+<p>
+  <img src="https://skillicons.dev/icons?i=python" />
 </p>
 
-<p align="center">
-  <img src="docs/img/memory-viewer-diary.png" alt="Memory Viewer - Diary" width="280">
-  <img src="docs/img/memory-viewer-knowledge.png" alt="Memory Viewer - Knowledge Graph" width="280">
-  <img src="docs/img/memory-viewer-meals.png" alt="Memory Viewer - Meals" width="280">
+* Ollama
+* LLMs Locales
+* Whisper
+* Embeddings
+* Knowledge Graph
+
+---
+
+## ⚙️ Backend
+
+<p>
+  <img src="https://skillicons.dev/icons?i=python" />
 </p>
 
-## Why Jarvis?
+* Python
+* MCP Protocol
+* REST APIs
+* Automatización
 
-**🔒 Your data stays yours** - 100% local AI processing. No cloud, no subscriptions, no data harvesting. Automatic redaction of sensitive info. This is non-negotiable.
+---
 
-**🗣️ A third person in the room** - Unlike voice assistants that only respond to rigid commands, Jarvis understands conversations. It maintains a short temporary rolling context of what's being discussed, so when you ask "Jarvis, what do you think?" it knows exactly what you're talking about. Have it chime into discussions with friends, help debug code while you talk through problems, or weigh in on decisions.
+## 💾 Almacenamiento
 
-**🧠 Never forgets** - Unlimited memory across conversations. Adapts tone naturally to the topic. Learns your preferences over time.
+* Memoria persistente
+* Knowledge Graph
+* Archivos locales
+* Configuración JSON
 
-**🎙️ Free dictation** - Hold a hotkey, speak, release — your words appear in any app as text. Like WisprFlow, but free, offline, and private. No subscription, no cloud transcription.
+---
 
-**🔌 Extensible** - MCP integration connects Jarvis to thousands of tools: smart home, GitHub, Slack, databases, and more. Smart tool selection means adding more tools won't slow things down.
+## 🧰 Herramientas
 
-**📊 Transparent progress** - We track what works (and what doesn't) with automated evals. [See current accuracy →](EVALS.md)
-
-**🚧 Known limitations:** Jarvis is under active development. Primary development happens on macOS. Windows/Linux support may lag behind. We're building in the open, [issues](https://github.com/isair/jarvis/issues) and [contributions](https://github.com/isair/jarvis/pulls) welcome!
-- Voice-only for now—no text chat interface yet ([#35](https://github.com/isair/jarvis/issues/35))
-- No mobile apps ([#17](https://github.com/isair/jarvis/issues/17))
-- "Stop" commands during speech sometimes get filtered as echo ([#24](https://github.com/isair/jarvis/issues/24))
-- Dictation is not available on macOS 26+ (Tahoe) due to a pynput incompatibility ([#172](https://github.com/isair/jarvis/issues/172))
-
-<details>
-<summary><strong>See it in action</strong> (example conversations)</summary>
-
-**Chiming into conversations** (the magic moment):
-```
-👤 Alice: I wonder what the weather will be like tomorrow
-👤 Bob: Yeah, we should check before planning the picnic
-👤 Alice: Jarvis, what do you think?
-  📝 Heard: "What do you think Jarvis?"
-  🧠 Intent (wake word): directed → "what do you think about the weather for the picnic"
-
-✨ Working on it: what do you think about the weather for the picnic
-  🧰 Tool: getWeather…
-  💬 Generating response...
-
-🤖 Jarvis
-Tomorrow looks great for a picnic! Sunny with highs around 22°C...
-```
-Jarvis understood the entire conversation and gave a contextual answer — no need to repeat the question.
-
-**Browser automation via MCP:**
-```
-  📝 Heard: "Open YouTube Jarvis."
-  🧠 Intent (wake word): directed → "open YouTube"
-
-✨ Working on it: open YouTube
-  💬 Generating response...
-
-🤖 Jarvis
-I have opened YouTube for you.
-```
-
-**Health-aware advice:**
-```
-  📝 Heard: "Should I order pizza tonight considering my health goals Jarvis?"
-  🧠 Intent (wake word): directed → "should I order pizza tonight considering my health goals"
-
-✨ Working on it: should I order pizza tonight considering my health goals
-  🧰 Tool: fetchMeals…
-  💬 Generating response...
-
-🤖 Jarvis
-Looking at your week — you mentioned wanting to lose 5kg by June...
-Today you've had about 860 calories so far. Given your 1,800 calorie target,
-you've got room for pizza! But maybe consider thin crust to save calories.
-```
-
-**Personalised news search:**
-```
-  📝 Heard: "What are some news from today that might interest me Jarvis?"
-  🧠 Intent (wake word): directed → "what are some news from today that might interest me"
-
-✨ Working on it: what are some news from today that might interest me
-  🧰 Tool: searchMemory…
-  🧰 Tool: webSearch…
-  💬 Generating response...
-
-🤖 Jarvis
-Here's a quick snapshot of today's headlines...
-```
-
-**Natural wake word placement** (say "Jarvis" anywhere):
-```
-  📝 Heard: "Give me a random topic to discuss Jarvis."
-  🧠 Intent (wake word): directed → "give me a random topic to discuss"
-
-✨ Working on it: give me a random topic to discuss
-  💬 Generating response...
-
-🤖 Jarvis
-How about the Fermi Paradox? Given the vast number of stars...
-```
-
-**Echo detection** (Jarvis ignores its own speech):
-```
-🤖 Jarvis
-I have opened YouTube for you.
-
-👂 Listening for follow-up (3s)...
-  📝 Heard: "I have opened YouTube for you."
-  🔇 Heard (echo): "i have opened youtube for you."
-💤 Returning to wake word mode
-```
-
-</details>
-
-## Quick Install
-
-### 1. Install Prerequisites
-
-| Platform | Requirement |
-|----------|-------------|
-| **All** | [Ollama](https://ollama.com/download) |
-
-### 2. Download Jarvis
-
-Get the latest from [GitHub Releases](https://github.com/isair/jarvis/releases):
-
-| Platform | Download | Run |
-|----------|----------|-----|
-| **Windows** | `Jarvis-Windows-x64.zip` | Extract → Run `Jarvis.exe` |
-| **macOS** | `Jarvis-macOS-arm64.zip` | Extract → Move to Applications → Right-click → Open |
-| **Linux** | `Jarvis-Linux-x64.tar.gz` | `tar -xzf` → Run `./Jarvis/Jarvis` |
-
-Jarvis starts listening automatically — just say "Jarvis" and talk!
-
-<p align="center">
-  <img src="docs/img/setup-wizard-initial-check.png" alt="Setup - Initial Check" width="200">
-  <img src="docs/img/setup-wizard-model.png" alt="Setup - Model Selection" width="200">
-  <img src="docs/img/setup-wizard-whisper.png" alt="Setup - Whisper" width="200">
-  <img src="docs/img/setup-wizard-dictation.png" alt="Setup - Dictation" width="200">
-  <img src="docs/img/setup-wizard-mcp.png" alt="Setup - MCP Servers" width="200">
-  <img src="docs/img/setup-wizard-complete.png" alt="Setup - Complete" width="200">
+<p>
+  <img src="https://skillicons.dev/icons?i=git,github,vscode" />
 </p>
 
-<p align="center">
-  <img src="docs/img/logs.png" alt="Real-time Logs" width="500">
-</p>
+* Git
+* GitHub
+* VS Code
+* Ollama
 
-## Features
+---
 
-- **Conversational Awareness** - Understands ongoing discussions. Ask "Jarvis, what do you think?" and it knows what you're talking about. Works naturally in multi-person conversations.
-- **Unlimited Memory** - Never forgets. Searches across all your conversation history. Memory Viewer GUI included.
-- **Adaptive Tone** - Automatically surgical for code, pragmatic for business, encouraging for wellbeing — no manual mode switching
-- **Smart Tool Selection** - Embedding-based relevance filtering picks only the tools needed per query — add unlimited MCP tools without performance degradation
-- **Built-in Tools** - Screenshot OCR, web search (DuckDuckGo → Brave → Wikipedia fallback chain with auto-fetch), weather, file access, nutrition tracking, location awareness, plus a tool-discovery escape hatch the agent uses to widen its own toolset mid-reply
-- **Knowledge Graph Memory** - Self-organising memory that learns from conversations, auto-splits by topic, and surfaces relevant knowledge automatically
-- **Natural Voice** - Say "Jarvis" anywhere in your sentence, interrupt with "stop", follow up without repeating the wake word
-- **Dictation Mode** - Free, offline alternative to WisprFlow — hold a hotkey, speak, release to paste text into any app
-- **MCP Integration** - Connect to thousands of external tools (Home Assistant, GitHub, Slack, etc.)
-
-## System Requirements
-
-| Hardware | VRAM | Model |
-|----------|------|-------|
-| Most users | 8GB+ | `gemma4:e2b` (default) |
-| Better quality | 16GB+ | `gemma4:e4b` |
-| High-end | 24GB+ | `gpt-oss:20b` |
-
-> **Note:** VRAM requirements include the intent judge model (`gemma4:e2b`) which is always loaded alongside the chat model for voice intent classification. The default model shares this, so no extra VRAM is needed.
-
-The setup wizard will guide you through model selection and installation on first launch.
-
-## Configuration
-
-Most users won't need to change anything. Open **⚙️ Settings** from the tray menu to configure Jarvis through a graphical interface — no JSON editing required. Settings are saved to `~/.config/jarvis/config.json`.
-
-<p align="center">
-  <img src="docs/img/settings-window.png" alt="Settings Window" width="500">
-  <img src="docs/img/settings-mcp.png" alt="Settings - MCP Servers" width="500">
-</p>
-
-<details>
-<summary><strong>Speech Recognition (Whisper)</strong></summary>
-
-#### Language Modes
-- **Multilingual** (default, 99 languages): `"whisper_model": "medium"`
-- **English Only** (slightly better English accuracy): `"whisper_model": "medium.en"`
-
-#### Model Sizes
-| Model | English | Multilingual | Download | VRAM | Speed |
-|-------|---------|--------------|----------|------|-------|
-| Tiny | `tiny.en` | `tiny` | ~75 MB | ~1 GB | ~10x |
-| Base | `base.en` | `base` | ~140 MB | ~1 GB | ~7x |
-| Small | `small.en` | `small` | ~465 MB | ~2 GB | ~4x |
-| **Medium** | `medium.en` | `medium` | ~1.5 GB | ~5 GB | ~2x |
-| Large V3 Turbo | - | `large-v3-turbo` | ~1.5 GB | ~6 GB | ~8x |
-
-Speed is relative to the original large model. [Source](https://github.com/openai/whisper)
-
-#### GPU Acceleration (Windows)
-If you have an NVIDIA GPU, Jarvis can use CUDA for much faster speech recognition. The Windows installer offers an optional CUDA download during setup. For development:
-```bash
-pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
-```
-CUDA is detected automatically — no configuration needed.
-
-#### Hallucination Filters
-Whisper sometimes produces confident but false transcriptions during silence or background noise (e.g. news-show intros, music). Two thresholds filter these out before they reach the intent judge:
-
-- `"whisper_min_confidence": 0.3` — drops segments whose `avg_logprob`-derived confidence falls below this value. Raise if you see low-confidence noise leaking through; lower if real speech is being dropped.
-- `"whisper_no_speech_threshold": 0.5` — drops any segment whose `no_speech_prob` is at or above this value, regardless of `avg_logprob`. Catches the case where Whisper is confident about a hallucinated phrase but its own no-speech signal says the audio was silent. Applies to both the faster-whisper and MLX backends.
-
-Both thresholds are exposed in the Settings window under *Whisper*.
-
-</details>
-
-<details>
-<summary><strong>Voice Interface (Advanced)</strong></summary>
-
-**LLM Intent Judge** - Jarvis uses `gemma4:e2b` for intelligent voice intent classification (echo detection, query extraction, stop commands). This model is automatically installed alongside your chosen chat model during setup. The intent judge cannot be disabled but gracefully falls back to simpler text matching if Ollama is unavailable.
-
-**Tool Router** - When `"tool_selection_strategy": "llm"` (the default), Jarvis asks a small LLM to pick which tools are relevant for each query, shrinking the tool catalogue the chat model sees. By default this routing call reuses the intent-judge model — it's already warm and small enough not to stall the turn. Override with `"tool_router_model": "<name>"` to dedicate a different model to routing. Other strategies: `"keyword"` (fast, no LLM), `"embedding"` (nomic-embed-text), `"all"` (no filtering).
-
-**Task-list Planner** - Before the agentic loop, Jarvis runs a short planning pass that decomposes multi-step queries into an ordered list of sub-tasks. For small models (`gemma4:e2b` class), each planned step is directly resolved to a concrete tool call without relying on the chat model to re-plan turn-by-turn. This significantly improves multi-step reliability. Config options:
-
-```json
-{
-  "planner_enabled": true,          // set to false to disable the planner entirely
-  "planner_model": "",              // override which model plans (default: reuses tool_router_model chain)
-  "planner_timeout_sec": 6.0        // per-call timeout for plan and step-resolver LLM calls
-}
-```
-
-</details>
-
-<details>
-<summary><strong>Small-Model Digest Passes (Advanced)</strong></summary>
-
-Small chat models (~2B, e.g. `gemma4:e2b`) degrade sharply as their prompt grows. Jarvis runs two cheap distil passes to keep the prompt tight:
-
-- **Memory digest** — boils diary + graph recall into a short relevance-filtered note before injecting it as background context.
-- **Tool-result digest** — boils a raw tool payload (especially webSearch UNTRUSTED WEB EXTRACT blocks) into a short attributed fact note before it reaches the main reply model.
-
-Both digest passes auto-enable for small models (≤7B) and stay off for large models. For small models, tool-result digest also prevents large fetch_web_page payloads from blowing the context window. Override in `~/.config/jarvis/config.json`:
-
-```json
-{
-  "memory_digest_enabled": null,          // null = auto-on for SMALL, false to force off, true to force on
-  "tool_result_digest_enabled": null,     // null = auto-on for SMALL, false to force off, true to force on
-  "llm_digest_timeout_sec": 8.0           // tight ceiling shared by both passes
-}
-```
-
-Field logs show `🧩 Memory digest: …` and `🧩 Tool digest: …` lines when a pass ran, so you can see when the substrate was replaced.
-
-</details>
-
-## Dictation Mode — Free WisprFlow Alternative
-
-Hold a hotkey to record speech, release to paste the transcription into any app. Works everywhere — your editor, browser, chat, terminal. Completely local, completely free.
-
-<p align="center">
-  <img src="docs/img/dictation-history.png" alt="Dictation History" width="400">
-  <img src="docs/img/setup-wizard-dictation.png" alt="Setup Wizard - Dictation" width="400">
-</p>
-
-| Platform | Default hotkey |
-|----------|---------------|
-| **Windows** | Ctrl + Win |
-| **macOS** | Ctrl + Option |
-| **Linux** | Ctrl + Alt |
-
-- 🔒 **100% offline** — your speech never leaves your machine (unlike cloud dictation services)
-- 🧠 **Shared Whisper model** — uses the same speech recognition as voice input, no extra memory
-- ⚡ **Zero latency startup** — no server round-trip, transcription starts the moment you release
-- 📋 **Universal paste** — works in any app that accepts `Ctrl+V` / `Cmd+V`
-- 🔇 **Non-intrusive** — main voice listener pauses automatically during dictation
-- ✋ **Hands-free mode** — double-tap the hotkey to keep recording without holding; press again or hit Escape to stop
-- 🧹 **Filler word removal** — optional LLM-powered cleanup removes "um", "uh", "like", "you know" while preserving meaning
-- 📖 **Custom dictionary** — define `"wrong -> right"` replacements for jargon, names, and technical terms
-- 📜 **History window** — browse, copy, or delete past dictations from the system tray
-- 🎛️ **Easy setup** — configure dictation during the setup wizard or anytime in Settings (hotkey dropdown, filler removal toggle, custom dictionary editor)
-
-Customise the hotkey in Settings or `config.json`:
-```json
-{
-  "dictation_hotkey": "ctrl+alt",
-  "dictation_filler_removal": true,
-  "dictation_custom_dictionary": [
-    "jarvis -> Jarvis",
-    "pytorch -> PyTorch"
-  ]
-}
-```
-
-> **Note:** macOS requires Accessibility permissions for the global hotkey. Linux requires X11 (limited Wayland support).
-
-<details>
-<summary><strong>Text-to-Speech</strong></summary>
-
-**Piper TTS (default)** - Neural TTS that auto-downloads on first use (~60MB):
-- Works out of the box - no setup required
-- High-quality British English male voice (en_GB-alan-medium)
-- Fast local synthesis with exact duration tracking
-
-To use different Piper voices, download from [HuggingFace](https://huggingface.co/rhasspy/piper-voices) and set:
-```json
-{
-  "tts_piper_model_path": "~/.local/share/jarvis/models/piper/en_GB-alan-medium.onnx"
-}
-```
-
-**Chatterbox** - AI voice with emotion control (requires running from source):
-```json
-{ "tts_engine": "chatterbox" }
-```
-
-Voice cloning with Chatterbox - add a 3-10 second .wav sample:
-```json
-{
-  "tts_engine": "chatterbox",
-  "tts_chatterbox_audio_prompt": "/path/to/voice.wav"
-}
-```
-
-</details>
-
-<details>
-<summary><strong>Location Detection</strong></summary>
-
-Jarvis can provide location-aware responses (weather, local time, etc.) using a local GeoLite2 database — no cloud geolocation services are used.
-
-**IP detection chain** (in order of preference):
-1. **Manual IP** — configure `location_ip_address` in settings
-2. **UPnP** — queries your local router (no traffic leaves LAN)
-3. **Socket heuristic** — determines which interface routes externally (no data sent)
-4. **OpenDNS DNS query** — single `myip.opendns.com` lookup to `208.67.222.222` (only external query)
-
-If your ISP uses carrier-grade NAT (CGNAT), Jarvis automatically resolves your true public IP via the same OpenDNS DNS query. This can be disabled:
-
-```json
-{
-  "location_cgnat_resolve_public_ip": false
-}
-```
-
-**Setup:** Register for a free [MaxMind GeoLite2](https://www.maxmind.com/en/geolite2/signup) account, download the City database (MMDB format), and save it to `~/.local/share/jarvis/geoip/GeoLite2-City.mmdb`. The setup wizard will guide you through this.
-
-</details>
-
-<details>
-<summary><strong>MCP Tool Integration</strong></summary>
-
-Connect Jarvis to external tools via [MCP servers](https://github.com/topics/mcp-server):
-
-```json
-{
-  "mcps": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_TOKEN": "your-token" }
-    }
-  }
-}
-```
-
-**Popular integrations:**
-- **Home Assistant** - Voice control for smart home
-- **Google Workspace** - Gmail, Calendar, Drive, Docs
-- **GitHub** - Issues, PRs, workflows
-- **Notion** - Knowledge management
-- **Slack/Discord** - Team communication
-- **Databases** - MySQL, PostgreSQL, MongoDB
-- **Composio** - 500+ apps in one integration
-
-See [full MCP setup guide](#mcp-integrations) below.
-
-</details>
-
-## MCP Integrations
-
-> **Session persistence:** each MCP server is launched once and its stdio session is kept open across tool calls. Stateful servers (e.g. browser automation, where the server owns a long-running Chrome process) work correctly. If you have a server you'd rather not keep resident, set `"idle_timeout_sec": 300` on its config entry and Jarvis will free it after that long without activity.
-
-<details>
-<summary><strong>Home Assistant</strong> - Smart home voice control</summary>
-
-1. Add MCP Server integration in Home Assistant (Settings → Devices & services)
-2. Expose entities you want to control (Settings → Voice assistants → Exposed entities)
-3. Create Long-lived Access Token (Profile → Security → Create token)
-4. Install proxy: `uv tool install git+https://github.com/sparfenyuk/mcp-proxy`
-5. Add to config:
-```json
-{
-  "mcps": {
-    "home_assistant": {
-      "command": "mcp-proxy",
-      "args": ["http://localhost:8123/mcp_server/sse"],
-      "env": { "API_ACCESS_TOKEN": "YOUR_TOKEN" }
-    }
-  }
-}
-```
-
-"Jarvis, turn on the living room lights" / "set bedroom to 72°" / "run good night scene"
-
-</details>
-
-<details>
-<summary><strong>Google Workspace</strong> - Gmail, Calendar, Drive, Docs, Sheets</summary>
-
-```json
-{
-  "mcps": {
-    "google_workspace": {
-      "command": "npx",
-      "args": ["-y", "google-workspace-mcp"],
-      "env": {
-        "GOOGLE_CLIENT_ID": "your-client-id",
-        "GOOGLE_CLIENT_SECRET": "your-client-secret"
-      }
-    }
-  }
-}
-```
-Setup: [taylorwilsdon/google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp)
-
-</details>
-
-<details>
-<summary><strong>GitHub</strong> - Repos, issues, PRs, workflows</summary>
-
-```json
-{
-  "mcps": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_TOKEN": "your-token" }
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary><strong>Notion, Slack, Discord, Databases</strong></summary>
-
-**Notion:**
-```json
-{ "mcps": { "notion": { "command": "npx", "args": ["-y", "@makenotion/mcp-server-notion"], "env": { "NOTION_API_KEY": "your-token" } } } }
-```
-
-**Slack:**
-```json
-{ "mcps": { "slack": { "command": "npx", "args": ["-y", "slack-mcp-server"], "env": { "SLACK_BOT_TOKEN": "xoxb-...", "SLACK_USER_TOKEN": "xoxp-..." } } } }
-```
-
-**Discord:**
-```json
-{ "mcps": { "discord": { "command": "npx", "args": ["-y", "discord-mcp-server"], "env": { "DISCORD_BOT_TOKEN": "your-token" } } } }
-```
-
-**Databases:** [bytebase/dbhub](https://github.com/bytebase/dbhub) (SQL), [mongodb-mcp-server](https://github.com/mongodb-js/mongodb-mcp-server) (MongoDB)
-
-</details>
-
-<details>
-<summary><strong>Composio</strong> - 500+ apps in one integration</summary>
-
-```json
-{
-  "mcps": {
-    "composio": {
-      "command": "npx",
-      "args": ["-y", "@composiohq/rube"],
-      "env": { "COMPOSIO_API_KEY": "your-key" }
-    }
-  }
-}
-```
-Get API key at [composio.dev](https://composio.dev)
-
-</details>
-
-## Troubleshooting
-
-<details>
-<summary><strong>Common issues</strong></summary>
-
-**First startup takes a bit** - Jarvis pre-warms the Whisper, chat, and intent-judge models before announcing "Listening!" so the first engagement feels instant. This adds a few seconds on cold start and is bounded at 60 s — if Ollama is slow, Jarvis will start listening anyway and load the models on demand.
-
-**Jarvis doesn't hear me** - Check microphone permissions, speak clearly after "Jarvis"
-
-**Responses are slow** - Ensure you have enough VRAM (8GB+ for default model; see System Requirements for other models)
-
-**Windows: App won't start** - Extract full zip first, check Windows Defender
-
-**macOS: "App can't be opened"** - Right-click → Open, or System Settings → Privacy & Security → Allow
-
-**Linux: No tray icon** - `sudo apt install libayatana-appindicator3-1`
-
-**Jarvis keeps deflecting on questions it answered before** - small models can record their own past failures into the diary, which then primes future sessions to repeat them. New writes are scrubbed automatically; to clean historical entries, open the Memory Viewer, switch to the Diary tab, and click **Clean up deflection narration** in the sidebar Maintenance section. Only sentences that narrate the assistant's failures are removed; the rest of each entry stays.
-
-</details>
-
-## For Developers
-
-<details>
-<summary><strong>Running from source</strong></summary>
+# 📂 Estructura del proyecto
 
 ```bash
-git clone https://github.com/isair/jarvis.git
+Jarvis/
+│
+├── src/
+│   ├── agent/
+│   ├── memory/
+│   ├── speech/
+│   ├── tools/
+│   ├── planner/
+│   ├── integrations/
+│   └── ui/
+│
+├── config/
+├── models/
+├── logs/
+├── docs/
+├── scripts/
+├── requirements.txt
+├── README.md
+└── LICENSE
+```
+
+---
+
+# 💻 Requisitos del sistema
+
+## Hardware recomendado
+
+| Configuración | VRAM  | Modelo      |
+| ------------- | ----- | ----------- |
+| Básico        | 8GB   | Gemma       |
+| Intermedio    | 16GB  | Gemma 4B    |
+| Avanzado      | 24GB+ | GPT-OSS 20B |
+
+---
+
+## Software requerido
+
+* Ollama
+* Python 3.10+
+* Git
+* Micrófono
+* Conexión opcional para búsquedas web
+
+---
+
+# ⚡ Instalación
+
+## 1️⃣ Clonar repositorio
+
+```bash
+git clone https://github.com/isairey/jarvis.git
+```
+
+---
+
+## 2️⃣ Entrar al proyecto
+
+```bash
 cd jarvis
+```
 
-# macOS
-bash scripts/run_macos.sh
+---
 
-# Windows (with Micromamba)
-pwsh -ExecutionPolicy Bypass -File scripts\run_windows.ps1
+## 3️⃣ Instalar dependencias
 
-# Linux
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 4️⃣ Instalar Ollama
+
+```bash
+https://ollama.com/download
+```
+
+---
+
+## 5️⃣ Ejecutar Jarvis
+
+### Windows
+
+```bash
+scripts/run_windows.ps1
+```
+
+### Linux
+
+```bash
 bash scripts/run_linux.sh
 ```
 
-Running from source enables Chatterbox TTS (AI voice with emotion/cloning). Piper TTS works in both bundled and source modes.
+### macOS
 
-</details>
+```bash
+bash scripts/run_macos.sh
+```
 
-<details>
-<summary><strong>Privacy hardening</strong> (stay 100% offline)</summary>
+---
+
+# ⚙️ Configuración
+
+## Archivo principal
 
 ```json
 {
-  "web_search_enabled": false,
-  "wikipedia_fallback_enabled": false,
-  "brave_search_api_key": "",
-  "mcps": {},
-  "location_auto_detect": false,
-  "location_cgnat_resolve_public_ip": false,
-  "location_enabled": false
+  "assistant_name": "Jarvis",
+  "voice_enabled": true,
+  "memory_enabled": true,
+  "web_search_enabled": true,
+  "planner_enabled": true
 }
 ```
 
-Verify: `sudo lsof -i -n -P | grep jarvis` (should only show 127.0.0.1 to Ollama)
+---
 
-</details>
+# 🎙️ Dictado Inteligente
 
-<details>
-<summary><strong>Web search fallback chain</strong></summary>
+Jarvis incluye un sistema de dictado completamente offline.
 
-When DuckDuckGo is rate-limited or returns nothing fetchable, Jarvis walks
-a small fallback chain before giving up rather than confabulating:
+### Características
 
-1. **Brave Search** — opt-in, requires `brave_search_api_key`. Free tier:
-   2,000 queries/month. Get a key at
-   [api.search.brave.com](https://api.search.brave.com/app/keys).
-2. **Wikipedia** — zero-config, on by default, uses the Wikipedia host
-   matching the language Whisper auto-detected on the utterance (so a
-   Turkish question gets a Turkish answer). Disable with
-   `wikipedia_fallback_enabled: false`.
-3. **Honest failure** — if every provider fails, the reply tells you the
-   search was blocked rather than making something up.
+* Conversión voz a texto
+* Funciona en cualquier aplicación
+* Sin conexión
+* Sin costo
+* Sin límites de uso
 
-The whole chain is bounded by a ~20s wall-clock deadline so a stalled
-provider can't run out the voice-assistant latency budget.
+---
 
-</details>
+# 🌍 Integraciones MCP
 
-## Privacy & Storage
+## Servicios compatibles
 
-- **100% offline** - No cloud services required
-- **Auto-redaction** - Emails, tokens, passwords automatically removed
-- **Local storage** - Everything in `~/.local/share/jarvis`
+* 🏠 Home Assistant
+* 📧 Gmail
+* 📅 Google Calendar
+* ☁️ Google Drive
+* 💻 GitHub
+* 💬 Slack
+* 🎮 Discord
+* 🗄️ MySQL
+* 🐘 PostgreSQL
+* 🍃 MongoDB
 
-## License
+---
 
-- **Personal use**: Free forever
-- **Commercial use**: [Contact us](mailto:baris@writeme.com)
+# 📊 Funcionalidades destacadas
 
-## Support
+## 🧠 Memoria Persistente
 
-[Report issues](https://github.com/isair/jarvis/issues) · [Discussions](https://github.com/isair/jarvis/discussions) · [Sponsor](https://github.com/sponsors/isair)
+* Recuerda conversaciones
+* Aprende preferencias
+* Recupera contexto automáticamente
+
+---
+
+## 🔍 Búsqueda Inteligente
+
+* DuckDuckGo
+* Brave Search
+* Wikipedia
+* Información contextual
+
+---
+
+## 🛡️ Seguridad
+
+* Datos locales
+* Redacción automática
+* Sin rastreo
+* Sin recopilación de información
+
+---
+
+# 🚧 Roadmap
+
+## 🔮 Próximas mejoras
+
+* 📱 Aplicación móvil
+* 💬 Interfaz de chat
+* 🎨 Avatar 3D
+* 🏠 Automatización avanzada
+* 🤖 Agentes especializados
+* 🌎 Traducción en tiempo real
+* 🧠 Mejoras en memoria semántica
+
+---
+
+# 🤝 Contribuciones
+
+Las contribuciones son bienvenidas ❤️
+
+## Cómo contribuir
+
+1. Fork del proyecto
+
+```bash
+git checkout -b feature/nueva-funcionalidad
+```
+
+2. Commit
+
+```bash
+git commit -m "✨ Nueva funcionalidad"
+```
+
+3. Push
+
+```bash
+git push origin feature/nueva-funcionalidad
+```
+
+4. Crear Pull Request 🚀
+
+---
+
+# 👨‍💻 Desarrollador
+
+<div align="center">
+
+## Isai Reyes — AI & Full Stack Developer
+
+Desarrollador apasionado por la inteligencia artificial, automatización, asistentes virtuales y arquitecturas modernas de software 🚀
+
+</div>
+
+---
+
+# 🌟 Apoya el proyecto
+
+⭐ Dale una estrella
+
+🍴 Haz Fork
+
+📢 Comparte el proyecto
+
+🤖 Ayuda a construir el futuro de los asistentes inteligentes
+
+---
+
+# 📜 Licencia
+
+Proyecto Open Source orientado al desarrollo de asistentes virtuales privados, inteligencia artificial local y automatización avanzada.
+
+---
+
+<div align="center">
+
+### 🤖 JARVIS AI Assistant — Tu asistente inteligente, privado y siempre disponible 🚀
+
+</div>
