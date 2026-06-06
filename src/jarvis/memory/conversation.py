@@ -1,0 +1,1772 @@
+from __future__ import annotations
+import json
+import re
+import time
+import threading
+from collections import OrderedDict
+from datetime import datetime, timezone
+from typing import Iterator, Optional, List, Tuple, Union, Callable
+from .db import Database
+from ..llm import call_llm_direct
+from .embeddings import get_embedding
+from ..debug import debug_log
+from ..utils.redact import redact, scrub_secrets
+
+
+_UNTRUSTED_FENCE_BEGIN = "<<<BEGIN UNTRUSTED WEB EXTRACT>>>"
+_UNTRUSTED_FENCE_END = "<<<END UNTRUSTED WEB EXTRACT>>>"
+
+
+# ── Deflection rewrite (LLM-driven historical cleanup) ────────────────────
+#
+# The summariser prompt forbids deflection narration at write time. There
+# is no post-write scrub — relying on the prompt keeps the pipeline single-
+# layered and language-agnostic. Old rows written before the prompt was
+# tightened can still contain leaked phrasing; ``rewrite_all_diary_summaries``
+# is a user-triggered bulk sweep that asks the chat model to rewrite each
+# row, removing sentences that narrate assistant failures while keeping
+# everything else verbatim.
+#
+# Why an LLM rather than regex: the leak shows up in any language the user
+# speaks, in any phrasing the model invents. A regex zoo is a whack-a-mole
+# we lose. A small instruction-following model handles the semantic check
+# in one shot, in any language, and improves automatically as the user's
+# chat model upgrades.
+
+_REWRITE_DEFLECTION_SYSTEM_PROMPT = """You are cleaning historical entries in a personal diary. Each entry summarises one day's conversation between a user and an AI assistant.
+
+Your task: return the entry with EVERY sentence removed whose subject is the assistant and whose verb describes the assistant's own inability, deflection, hesitation, or non-knowledge. Keep every other sentence verbatim — do not paraphrase, reorder, translate, or "improve" anything else.
+
+Sentences to REMOVE (and any equivalent phrasing in any other language):
+- "The assistant could not / couldn't / cannot / can't / was not able / was unable / failed to ..."
+- "The assistant did not / didn't / does not / doesn't have / know / find / access ..."
+- "The assistant said / noted / explained / stated / clarified / acknowledged / admitted / apologised that it could not / cannot / didn't / does not / had no / lacked ..."
+- "The assistant offered to search / help / look, suggested checking, recommended consulting ..."
+- "The assistant lacks / has no / had no information / details / access ..."
+
+Sentences to KEEP (these are NOT deflections):
+- "The user asked about X." — record of a user request, no assistant failure narrated.
+- "The assistant said Possessor is a 2020 film by Brandon Cronenberg." — attributed factual claim.
+- "The user said they prefer Celsius." — user-stated fact.
+- "The user told the assistant to always reply in British English." — user directive, not assistant failure.
+- "The weather in London was 12°C." — tool-grounded fact.
+
+Output format: return the cleaned summary text only. No prose framing, no markdown, no explanation, no labels. Output the empty string if every sentence is a deflection. Output the input verbatim if nothing needs removing.
+
+This task applies in every language. Do NOT translate the output — keep the original language."""
+
+
+def _rewrite_diary_summary(
+    summary: str,
+    ollama_base_url: str,
+    ollama_chat_model: str,
+    timeout_sec: float = 30.0,
+) -> Optional[str]:
+    """Ask the chat model to remove deflection narration from one summary.
+
+    Returns the rewritten text, or ``None`` on LLM failure. The empty
+    string is a legitimate result ("entire summary was deflection") but
+    callers must guard against persisting it (we keep the original in
+    that case — empty diary entries are worse than slightly-leaky ones).
+    """
+    if not summary or not summary.strip():
+        return summary
+
+    try:
+        # Fence the diary content so the model treats it as data, not
+        # instructions. Same pattern used for untrusted web extracts —
+        # the diary may contain any past LLM output, which can include
+        # text that *looks* like instructions.
+        user_prompt = (
+            f"{_UNTRUSTED_FENCE_BEGIN}\n"
+            f"{summary}\n"
+            f"{_UNTRUSTED_FENCE_END}\n\n"
+            "Return the cleaned text only."
+        )
+        raw = call_llm_direct(
+            ollama_base_url,
+            ollama_chat_model,
+            _REWRITE_DEFLECTION_SYSTEM_PROMPT,
+            user_prompt,
+            timeout_sec=timeout_sec,
+        )
+    except Exception as e:
+        debug_log(
+            f"diary rewrite: LLM call failed — {type(e).__name__}",
+            "memory",
+        )
+        return None
+
+    if raw is None:
+        return None
+
+    # Strip whitespace and any markdown fences the model may have wrapped
+    # around the response despite the instructions. Two shapes are common:
+    #   "```optional-tag\n<content>\n```"  — the canonical multi-line shape
+    #   "```<content>```"                  — single-line, malformed but seen
+    # Both must be unwrapped: the previous regex-only path treated the
+    # single-line shape as one giant opening fence and consumed the whole
+    # response, tripping the empty-rewrite guard and dropping a clean
+    # rewrite for no good reason.
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+        # Multi-line case: drop the optional language tag up to the first
+        # newline. We only look in the first 50 chars to avoid consuming
+        # legitimate inline backticks deeper in the content.
+        head = cleaned[:50]
+        if "\n" in head:
+            cleaned = cleaned.split("\n", 1)[1]
+        # Closing fence (works for both shapes).
+        if cleaned.rstrip().endswith("```"):
+            cleaned = cleaned.rstrip()[:-3]
+        cleaned = cleaned.strip()
+    # Some models like to echo the fence markers back. Strip them if so.
+    if cleaned.startswith(_UNTRUSTED_FENCE_BEGIN):
+        cleaned = cleaned[len(_UNTRUSTED_FENCE_BEGIN):].lstrip()
+    if cleaned.endswith(_UNTRUSTED_FENCE_END):
+        cleaned = cleaned[:-len(_UNTRUSTED_FENCE_END)].rstrip()
+
+    return cleaned
+
+
+def rewrite_all_diary_summaries(
+    db: Database,
+    ollama_base_url: str,
+    ollama_chat_model: str,
+    ollama_embed_model: Optional[str] = None,
+    embed_timeout_sec: float = 15.0,
+    rewrite_timeout_sec: float = 30.0,
+) -> Iterator[dict]:
+    """Walk every row in ``conversation_summaries`` and ask the chat model
+    to remove deflection narration. Writes back only when the row changed.
+
+    Preserves each row's original ``ts_utc`` on rewrite — the audit trail
+    of when each summary was *originally* written must survive a
+    maintenance pass.
+
+    Regenerates the row's vector embedding inline when both
+    ``ollama_base_url`` and ``ollama_embed_model`` are provided and the
+    DB has VSS enabled. Embedding regeneration is *best-effort*: if the
+    embedding service fails we still keep the cleaned summary, since the
+    FTS index stays consistent via SQLite triggers regardless.
+
+    Yields one event dict per row as the walk progresses. Event payload
+    contains *only* counts and the date — never raw summary text — so
+    the streaming UI cannot leak diary content. Privacy first.
+
+    Fail-open at every layer:
+    - LLM call failure on a row → row is left untouched and reported
+      with ``error`` set to the exception class name only (never the
+      exception message — that can echo offending input back).
+    - Empty rewrite (model thinks the whole row was deflection) → row
+      is left untouched. An empty diary entry is worse than a slightly-
+      leaky one because retrieval treats absence as "no record". The
+      ``would_empty`` flag is surfaced so the UI can show the near-miss.
+    - Per-row write failure → row is reported with ``error``, the sweep
+      continues with the rest.
+
+    Mirrors ``optimise_diary_topics`` for shape and privacy guarantees.
+    """
+    can_reembed = bool(ollama_base_url and ollama_embed_model and db.is_vss_enabled)
+
+    rows = db.get_all_conversation_summaries()
+    for row in rows:
+        date_utc = row["date_utc"]
+        original = row["summary"] or ""
+        chars_before = len(original)
+
+        if not original.strip():
+            yield {
+                "date_utc": date_utc,
+                "chars_before": chars_before,
+                "chars_after": chars_before,
+                "rewritten": False,
+                "would_empty": False,
+                "embedding_refreshed": False,
+            }
+            continue
+
+        cleaned = _rewrite_diary_summary(
+            original,
+            ollama_base_url,
+            ollama_chat_model,
+            timeout_sec=rewrite_timeout_sec,
+        )
+        if cleaned is None:
+            # LLM failure on this row. Leave it untouched and continue.
+            yield {
+                "date_utc": date_utc,
+                "chars_before": chars_before,
+                "chars_after": chars_before,
+                "rewritten": False,
+                "would_empty": False,
+                "embedding_refreshed": False,
+                "error": "RewriteFailed",
+            }
+            continue
+
+        cleaned_stripped = cleaned.strip()
+        # Empty rewrite → keep the original. Empty diary entries are
+        # worse than leaky ones because retrieval treats absence as
+        # "no record" and the user loses the topic entirely.
+        if not cleaned_stripped:
+            yield {
+                "date_utc": date_utc,
+                "chars_before": chars_before,
+                "chars_after": chars_before,
+                "rewritten": False,
+                "would_empty": True,
+                "embedding_refreshed": False,
+            }
+            continue
+
+        if cleaned_stripped == original.strip():
+            yield {
+                "date_utc": date_utc,
+                "chars_before": chars_before,
+                "chars_after": chars_before,
+                "rewritten": False,
+                "would_empty": False,
+                "embedding_refreshed": False,
+            }
+            continue
+
+        embedding_refreshed = False
+        try:
+            summary_id = db.upsert_conversation_summary(
+                date_utc=date_utc,
+                summary=cleaned_stripped,
+                topics=row["topics"],
+                source_app=row["source_app"],
+                ts_utc=row["ts_utc"],
+            )
+        except Exception as e:
+            debug_log(
+                f"diary rewrite: write-back failed for {date_utc} — "
+                f"{type(e).__name__}",
+                "memory",
+            )
+            yield {
+                "date_utc": date_utc,
+                "chars_before": chars_before,
+                "chars_after": chars_before,
+                "rewritten": False,
+                "would_empty": False,
+                "embedding_refreshed": False,
+                "error": type(e).__name__,
+            }
+            continue
+
+        if can_reembed:
+            try:
+                text_for_embedding = f"{cleaned_stripped} {row['topics'] or ''}"
+                vec = get_embedding(
+                    text_for_embedding,
+                    ollama_base_url,
+                    ollama_embed_model,
+                    timeout_sec=embed_timeout_sec,
+                )
+                if vec is not None:
+                    db.upsert_summary_embedding(summary_id, vec)
+                    embedding_refreshed = True
+            except Exception as e:
+                # Best-effort. Cleaned summary is already persisted;
+                # FTS stays consistent via triggers. A stale embedding
+                # is recoverable on the next user-driven write.
+                debug_log(
+                    f"diary rewrite: embedding refresh failed for "
+                    f"{date_utc} — {type(e).__name__}",
+                    "memory",
+                )
+
+        debug_log(
+            f"diary rewrite: cleaned {date_utc} — "
+            f"{chars_before}→{len(cleaned_stripped)} chars "
+            f"(embedding_refreshed={embedding_refreshed})",
+            "memory",
+        )
+
+        yield {
+            "date_utc": date_utc,
+            "chars_before": chars_before,
+            "chars_after": len(cleaned_stripped),
+            "rewritten": True,
+            "would_empty": False,
+            "embedding_refreshed": embedding_refreshed,
+        }
+
+
+# ── Topic optimisation (LLM-driven taxonomy normalisation) ────────────────
+#
+# Topic tags extracted by the summariser are independent per-diary-write,
+# so the same concept can appear under multiple surface forms over time
+# ("cook", "cooking", "meal prep"). This sweep collects all unique tags
+# across every conversation_summaries row, asks the LLM once to propose
+# a normalised taxonomy (merging synonyms, splitting compound tags), then
+# applies the mapping to every row that needs updating.
+#
+# One LLM call for the whole database keeps latency predictable regardless
+# of diary length. The mapping is applied locally — no further LLM calls
+# during the per-row write phase.
+#
+# Fail-open: if the LLM returns None or unparseable JSON the sweep yields
+# events with topics_changed=False for every row and leaves the DB untouched.
+# A per-row write failure is also non-fatal and is reported via an 'error'
+# field (exception class name only, never message text, so corrupted row
+# content cannot leak through stringified exceptions).
+
+_TOPIC_OPTIMISE_SYSTEM_PROMPT = (
+    "You normalise topic-tag taxonomies for a personal diary. "
+    "You will receive a newline-separated list of tags extracted from diary entries. "
+    "Return a JSON object that maps each input tag to its normalised replacement.\n\n"
+    "Rules:\n"
+    "1. All output tags must be lowercase with no trailing punctuation.\n"
+    "2. Merge near-synonyms into one canonical form "
+    "(e.g. \"cook\", \"cooking\", \"meal prep\" → \"cooking\").\n"
+    "3. Split a compound tag into an array only if it clearly covers "
+    "unrelated topics (e.g. \"fitness and nutrition\" → [\"fitness\", \"nutrition\"]). "
+    "Most tags do NOT need splitting — prefer merging over splitting.\n"
+    "4. Keep specific, distinct tags as-is (e.g. \"python\", \"travel\", \"finance\").\n"
+    "5. Do not invent new tags that were not present or implied by the input.\n"
+    "6. Every input tag must appear as a key in the output JSON.\n\n"
+    "Respond with ONLY a valid JSON object. "
+    "No prose, no markdown fences, no explanation.\n\n"
+    "Example input:\ncook\ncooking\nworkout\nfitness\nfitness and nutrition\n\n"
+    "Example output:\n"
+    "{\"cook\": \"cooking\", \"cooking\": \"cooking\", "
+    "\"workout\": \"fitness\", \"fitness\": \"fitness\", "
+    "\"fitness and nutrition\": [\"fitness\", \"nutrition\"]}"
+)
+
+
+def _apply_topic_mapping(
+    topics_str: str,
+    mapping: dict[str, str | list[str]],
+) -> str:
+    """Apply a normalisation mapping to a comma-separated topics string.
+
+    Each topic is looked up in ``mapping``:
+    - string value → replace with that string
+    - list value   → expand to multiple tags (split)
+    - missing key  → keep the original tag unchanged
+
+    Deduplicates the result while preserving order (first occurrence wins).
+    """
+    original_tags = [t.strip() for t in topics_str.split(",") if t.strip()]
+    seen: set[str] = set()
+    result: list[str] = []
+    for tag in original_tags:
+        replacement = mapping.get(tag, tag)
+        if isinstance(replacement, list):
+            for r in replacement:
+                r = r.strip()
+                if r and r not in seen:
+                    seen.add(r)
+                    result.append(r)
+        else:
+            r = replacement.strip() if isinstance(replacement, str) else tag
+            if r and r not in seen:
+                seen.add(r)
+                result.append(r)
+    return ", ".join(result)
+
+
+def optimise_diary_topics(
+    db: Database,
+    ollama_base_url: str,
+    ollama_chat_model: str,
+    ollama_embed_model: Optional[str] = None,
+    embed_timeout_sec: float = 15.0,
+) -> Iterator[dict]:
+    """Normalise topic tags across every ``conversation_summaries`` row.
+
+    Collects all unique tags from the database, asks the LLM once for a
+    normalised taxonomy (merging synonyms, optionally splitting compound
+    tags), then applies the mapping to each row. Rows with no topics are
+    skipped. Rows whose topics are unchanged after mapping are not written.
+
+    Preserves each row's original ``ts_utc`` on rewrite — a maintenance
+    pass must not make cleaned rows look like new writes.
+
+    Yields one event dict per row processed:
+    ``{date_utc, topics_changed, old_topic_count, new_topic_count, error?}``.
+    The payload contains no raw tag strings — only counts and the date — so
+    the streaming UI cannot inadvertently echo diary content.
+
+    Fail-open: LLM failure or JSON parse error leaves all rows unchanged.
+    Per-row write failures are non-fatal; the sweep continues.
+    """
+    rows = db.get_all_conversation_summaries()
+    if not rows:
+        return
+
+    # Collect all unique non-empty topics across all rows.
+    unique_topics: list[str] = []
+    seen_topics: set[str] = set()
+    for row in rows:
+        if not row["topics"]:
+            continue
+        for tag in row["topics"].split(","):
+            tag = tag.strip()
+            if tag and tag not in seen_topics:
+                seen_topics.add(tag)
+                unique_topics.append(tag)
+
+    # If there are no topics at all, emit a no-op event per row and stop.
+    if not unique_topics:
+        for row in rows:
+            yield {
+                "date_utc": row["date_utc"],
+                "topics_changed": False,
+                "old_topic_count": 0,
+                "new_topic_count": 0,
+                "embedding_refreshed": False,
+            }
+        return
+
+    # One LLM call to get the normalised mapping.
+    mapping: dict[str, str | list[str]] = {}
+    try:
+        user_content = "\n".join(unique_topics)
+        raw = call_llm_direct(
+            ollama_base_url,
+            ollama_chat_model,
+            _TOPIC_OPTIMISE_SYSTEM_PROMPT,
+            user_content,
+            timeout_sec=60.0,
+        )
+        if raw:
+            # Strip markdown fences if the model wrapped the JSON.
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[^\n]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                mapping = parsed
+    except Exception as e:
+        debug_log(
+            f"diary topic optimise: LLM call or parse failed — {type(e).__name__}",
+            "memory",
+        )
+        # Fail-open: yield no-op events for every row and return.
+        for row in rows:
+            count = len([t for t in row["topics"].split(",") if t.strip()]) if row["topics"] else 0
+            yield {
+                "date_utc": row["date_utc"],
+                "topics_changed": False,
+                "old_topic_count": count,
+                "new_topic_count": count,
+                "error": type(e).__name__,
+            }
+        return
+
+    # Apply the mapping to each row.
+    can_reembed = bool(ollama_base_url and ollama_embed_model and db.is_vss_enabled)
+    for row in rows:
+        date_utc = row["date_utc"]
+        original_topics = row["topics"] or ""
+        old_count = len([t for t in original_topics.split(",") if t.strip()]) if original_topics else 0
+
+        if not original_topics.strip():
+            yield {
+                "date_utc": date_utc,
+                "topics_changed": False,
+                "old_topic_count": 0,
+                "new_topic_count": 0,
+                "embedding_refreshed": False,
+            }
+            continue
+
+        try:
+            new_topics = _apply_topic_mapping(original_topics, mapping)
+        except Exception as e:
+            debug_log(
+                f"diary topic optimise: mapping failed for {date_utc} — {type(e).__name__}",
+                "memory",
+            )
+            yield {
+                "date_utc": date_utc,
+                "topics_changed": False,
+                "old_topic_count": old_count,
+                "new_topic_count": old_count,
+                "error": type(e).__name__,
+            }
+            continue
+
+        new_count = len([t for t in new_topics.split(",") if t.strip()]) if new_topics else 0
+        topics_changed = new_topics != original_topics
+
+        embedding_refreshed = False
+        if topics_changed:
+            try:
+                summary_id = db.upsert_conversation_summary(
+                    date_utc=date_utc,
+                    summary=row["summary"],
+                    topics=new_topics,
+                    source_app=row["source_app"],
+                    ts_utc=row["ts_utc"],
+                )
+            except Exception as e:
+                debug_log(
+                    f"diary topic optimise: write-back failed for {date_utc} — {type(e).__name__}",
+                    "memory",
+                )
+                yield {
+                    "date_utc": date_utc,
+                    "topics_changed": False,
+                    "old_topic_count": old_count,
+                    "new_topic_count": old_count,
+                    "error": type(e).__name__,
+                }
+                continue
+
+            if can_reembed:
+                try:
+                    text_for_embedding = f"{row['summary'] or ''} {new_topics}"
+                    vec = get_embedding(
+                        text_for_embedding,
+                        ollama_base_url,
+                        ollama_embed_model,
+                        timeout_sec=embed_timeout_sec,
+                    )
+                    if vec is not None:
+                        db.upsert_summary_embedding(summary_id, vec)
+                        embedding_refreshed = True
+                except Exception as e:
+                    debug_log(
+                        f"diary topic optimise: embedding refresh failed for "
+                        f"{date_utc} — {type(e).__name__}",
+                        "memory",
+                    )
+
+            debug_log(
+                f"diary topic optimise: updated {date_utc} — "
+                f"{old_count} tags → {new_count} tags",
+                "memory",
+            )
+
+        yield {
+            "date_utc": date_utc,
+            "topics_changed": topics_changed,
+            "old_topic_count": old_count,
+            "new_topic_count": new_count,
+            "embedding_refreshed": embedding_refreshed,
+        }
+
+
+def _scrub_tool_call(tc: dict) -> dict:
+    """Return a copy of a tool-call entry with the function arguments
+    scrubbed of secrets. Handles both dict and string-encoded arguments
+    (some providers serialise arguments as a JSON string).
+    """
+    if not isinstance(tc, dict):
+        return tc
+    out = dict(tc)
+    fn = out.get("function")
+    if isinstance(fn, dict):
+        fn_out = dict(fn)
+        fn_out["arguments"] = _scrub_args(fn_out.get("arguments"))
+        out["function"] = fn_out
+    return out
+
+
+def _scrub_args(args):
+    """Scrub a tool-call ``arguments`` value of secrets.
+
+    Handles every shape we have seen across providers: JSON-encoded
+    strings, dict objects, and (rarely) lists/tuples of values. Anything
+    else passes through untouched — there is no safe way to scrub an
+    opaque scalar.
+    """
+    if isinstance(args, str) and args:
+        return scrub_secrets(args)
+    if isinstance(args, dict):
+        return {k: _scrub_args(v) for k, v in args.items()}
+    if isinstance(args, (list, tuple)):
+        scrubbed = [_scrub_args(v) for v in args]
+        return type(args)(scrubbed) if isinstance(args, tuple) else scrubbed
+    return args
+
+
+def is_tool_message(msg: dict) -> bool:
+    """True if a message is a tool-call request or a tool-result.
+
+    Covers both protocols Jarvis speaks:
+    - Native: ``role="tool"`` for results, or ``role="assistant"`` carrying
+      a non-empty ``tool_calls`` list for the outbound call.
+    - Text-tool fallback (small models): the tool result is appended as a
+      ``role="user"`` message tagged with ``tool_name``. The tagging is
+      done by the reply engine in `src/jarvis/reply/engine.py` (see the
+      text-tool branch where ``"tool_name": tool_name`` is attached to
+      the synthetic user message).
+    """
+    if not isinstance(msg, dict):
+        return False
+    role = msg.get("role")
+    if role == "tool":
+        return True
+    if role == "assistant" and msg.get("tool_calls"):
+        return True
+    if role == "user" and msg.get("tool_name"):
+        return True
+    return False
+
+
+def _filter_contexts_by_time(
+    contexts: List[str],
+    from_time: Optional[str],
+    to_time: Optional[str],
+    voice_debug: bool = False
+) -> List[str]:
+    """Helper to filter context strings by time range."""
+    if not from_time and not to_time:
+        return contexts
+
+    filtered = []
+    from_dt = None
+    to_dt = None
+
+    try:
+        if from_time:
+            from_dt = datetime.fromisoformat(from_time.replace('Z', '+00:00'))
+        if to_time:
+            to_dt = datetime.fromisoformat(to_time.replace('Z', '+00:00'))
+    except Exception as e:
+        if voice_debug:
+            debug_log(f"      📋 Error parsing time: {e}", "memory")
+        return contexts
+
+    import re
+    for ctx in contexts:
+        # Extract date from formatted text like "[2025-08-27] ..."
+        date_match = re.match(r'\[(\d{4}-\d{2}-\d{2})\]', ctx)
+        if date_match:
+            date_str = date_match.group(1)
+            try:
+                ctx_date = datetime.fromisoformat(date_str + 'T00:00:00+00:00')
+
+                in_range = True
+                if from_dt and ctx_date.date() < from_dt.date():
+                    in_range = False
+                if to_dt and ctx_date.date() > to_dt.date():
+                    in_range = False
+
+                if in_range:
+                    filtered.append(ctx)
+            except Exception:
+                filtered.append(ctx)  # Keep if can't parse date
+        else:
+            filtered.append(ctx)  # Keep non-dated entries
+
+    return filtered
+
+
+class DialogueMemory:
+    """
+    In-memory storage for recent dialogue interactions.
+    Provides short-term context for the configured dialogue memory window.
+
+    Thread-safe: uses a lock to protect against concurrent diary updates.
+    Tracks saved messages by timestamp to prevent data loss when new messages
+    arrive during diary update.
+
+    The dialogue memory window and the forced diary update interval share the
+    same duration (dialogue_memory_timeout). After a diary update, saved messages
+    older than this window are cleaned up; the enrichment feature retrieves any
+    relevant earlier context from the diary. The rolling transcript buffer is
+    separate (ambient speech for intent judging).
+    """
+
+    def __init__(self, inactivity_timeout: float = 300.0, max_interactions: int = 20):
+        """Initialize dialogue memory.
+
+        The inactivity_timeout drives two unified durations:
+        - RECENT_WINDOW_SEC: how long messages are kept in memory for context
+        - MAX_UNSAVED_AGE_SEC: how old unsaved messages can get before forcing
+          a diary update (same as the window, since enrichment covers older context)
+        """
+        self._messages: List[Tuple[float, str, str]] = []  # (timestamp, role, content)
+        # Tool carryover: in-loop assistant-with-tool_calls + tool-role messages
+        # from prior replies, so follow-up turns within the hot window can reuse
+        # the prior tool output instead of re-fetching. Stored as a list of
+        # (timestamp, [msg_dict, ...]) where each entry is one reply's worth of
+        # tool-related messages. Excluded from `get_pending_chunks` so raw tool
+        # payloads never reach the diary summariser.
+        self._tool_turns: List[Tuple[float, List[dict]]] = []
+        # Conversation-scoped scratch cache: per-key (timestamp, value)
+        # entries that survive for the lifetime of the active conversation.
+        # The reply engine wipes this on new-conversation entry (when
+        # ``has_recent_messages`` was False at turn start), and individual
+        # entries can be invalidated on demand (e.g. ``invalidate_warm_profile``
+        # on graph mutations). The timestamp is retained so callers may
+        # inspect entry age, but reads are NOT bounded by RECENT_WINDOW_SEC
+        # any more — long active conversations would otherwise see warm
+        # profile / router caches expire while the session is still going.
+        # LRU-bounded so per-query keys (router cache, enrichment extractor
+        # cache) cannot grow without limit during long active sessions.
+        # Reads bump recency; writes evict the least-recently-used entry
+        # once the cap is reached. ``WARM_PROFILE_CACHE_KEY`` is a single
+        # query-agnostic entry so the cap easily covers it; explicit
+        # invalidation hooks (``clear_hot_cache``, ``invalidate_warm_profile``,
+        # new-conversation reset) still apply unchanged.
+        self._hot_cache: "OrderedDict[str, Tuple[float, object]]" = OrderedDict()
+        # Hard ceiling on stored tool turns. With the default
+        # ``tool_carryover_max_turns=2`` re-injected per reply, 16 lets a
+        # session accumulate roughly 8x the visible budget before the
+        # oldest entries get evicted; well below the prompt-bloat
+        # threshold, well above any realistic single-conversation need.
+        self._tool_turns_max_storage = 16
+        # Monotonic high-water timestamp. ``time.time()`` has ~16ms
+        # granularity on Windows, so consecutive inserts can collide and
+        # break interleave ordering between text and tool messages. We
+        # bump the stored ts by a tiny epsilon so insertion order is
+        # always preserved, while keeping wall-clock semantics close
+        # enough for the RECENT_WINDOW_SEC cutoff.
+        self._last_ts: float = 0.0
+        self._last_activity_time: float = time.time()
+        self._inactivity_timeout = inactivity_timeout
+        # Unified window: context retention = forced diary update interval
+        self.RECENT_WINDOW_SEC = inactivity_timeout
+        self.MAX_UNSAVED_AGE_SEC = inactivity_timeout
+        # Track the timestamp up to which messages have been saved to diary
+        # Messages with timestamp <= this value have been processed
+        self._last_saved_timestamp: float = 0.0
+        self._lock = threading.RLock()  # Reentrant lock for thread safety
+        # Track the last profile used for follow-up detection
+        self._last_profile: Optional[str] = None
+
+    def _next_ts(self) -> float:
+        """Return a strictly-monotonic timestamp.
+
+        On Windows, ``time.time()`` has ~16ms granularity — consecutive
+        calls within the same tick return the identical float. That
+        breaks interleave ordering between text messages and tool turns
+        when both land in the same tick. We bump by a 1µs epsilon so
+        insertion order is always preserved while staying close enough
+        to wall-clock for ``RECENT_WINDOW_SEC`` filtering.
+
+        Caller MUST hold ``_lock`` — ``_last_ts`` is shared mutable state.
+        """
+        now = time.time()
+        if now <= self._last_ts:
+            now = self._last_ts + 1e-6
+        self._last_ts = now
+        return now
+
+    def add_message(self, role: str, content: str) -> None:
+        """Add a message to recent memory. Thread-safe."""
+        with self._lock:
+            timestamp = self._next_ts()
+            self._messages.append((timestamp, role.strip(), content.strip()))
+            self._last_activity_time = timestamp
+
+    def get_recent_context(self) -> List[str]:
+        """Get recent messages formatted as context strings."""
+        messages = self.get_recent_messages()
+        return [f"{msg['role'].title()}: {msg['content']}" for msg in messages]
+
+    def get_recent_messages(self) -> List[dict]:
+        """
+        Get recent messages (last 5 minutes) formatted for LLM API.
+
+        Returns:
+            List of message dictionaries with 'role' and 'content' keys
+        """
+        with self._lock:
+            if not self._messages:
+                return []
+
+            # Filter to last 5 minutes
+            cutoff = time.time() - self.RECENT_WINDOW_SEC
+            recent_messages = [msg for msg in self._messages if msg[0] >= cutoff]
+
+            return [{"role": role, "content": content} for _, role, content in recent_messages]
+
+    def record_tool_turn(self, tool_msgs: List[dict]) -> None:
+        """Store in-loop tool-call/tool-role messages from a just-finished reply.
+
+        Called once per reply with the tool-related messages extracted from the
+        engine's messages array. These interleave with text messages on
+        subsequent `get_recent_turns_with_tools` calls so follow-ups can see
+        the prior tool output.
+        """
+        if not tool_msgs:
+            return
+        # Scrub outside the lock, pure function over message content.
+        scrubbed: List[dict] = []
+        for m in tool_msgs:
+            mm = dict(m)
+            c = mm.get("content")
+            if isinstance(c, str) and c:
+                # Tool outputs may contain PII or secrets (email bodies,
+                # API responses, scraped pages). Scrub before persisting
+                # so re-injection on the next turn can't leak them.
+                mm["content"] = scrub_secrets(c)
+            # Native tool-call arguments can also carry sensitive query
+            # text (e.g. webSearch(query="my email is alice@example.com")).
+            # Scrub each argument value so re-injection of the assistant
+            # tool_calls row on the next turn cannot leak them.
+            tcalls = mm.get("tool_calls")
+            if isinstance(tcalls, list):
+                mm["tool_calls"] = [_scrub_tool_call(tc) for tc in tcalls]
+            scrubbed.append(mm)
+        with self._lock:
+            ts = self._next_ts()
+            self._tool_turns.append((ts, scrubbed))
+            # Bound storage to a hard ceiling. Tool turns are NOT pruned
+            # by RECENT_WINDOW_SEC age any more; the engine clears them
+            # on new-conversation entry so an active session keeps its
+            # carryover regardless of how long ago each tool fired.
+            if len(self._tool_turns) > self._tool_turns_max_storage:
+                self._tool_turns = self._tool_turns[-self._tool_turns_max_storage:]
+
+    def clear_tool_carryover(self) -> None:
+        """Drop all stored tool-turn messages. Text messages are untouched."""
+        with self._lock:
+            self._tool_turns = []
+
+    # ------------------------------------------------------------------
+    # Conversation-scoped scratch cache
+    # ------------------------------------------------------------------
+    # Primitive used by the reply engine to memoise expensive per-turn
+    # work that's idempotent within a single conversation: warm profile
+    # (SQLite reads), memory enrichment extractor (LLM call), tool
+    # router (LLM call).
+    #
+    # Lifetime contract:
+    # - Entries persist for the lifetime of the active conversation;
+    #   they are NOT bounded by RECENT_WINDOW_SEC age. A long active
+    #   chat keeps the warm profile / router cache hot for hours.
+    # - The reply engine wipes the cache when it detects a new
+    #   conversation (i.e. ``has_recent_messages()`` was False at turn
+    #   entry) and on the ``stop`` signal.
+    # - Granular invalidation hooks: ``invalidate_warm_profile()`` is
+    #   called from a graph-mutation listener so the User / Directives
+    #   branches stay fresh even mid-conversation.
+    #
+    # Callers pick a key that captures the invalidation contract —
+    # typically the redacted query for query-dependent values, or a
+    # constant for query-agnostic values.
+
+    # Cache key for the warm-profile block. Centralised so the engine
+    # and the graph-mutation invalidator agree on it.
+    WARM_PROFILE_CACHE_KEY = "warm_profile_block"
+
+    # LRU cap for the conversation-scoped scratch cache. The engine writes
+    # at most three keys per turn (router, enrichment extractor, warm
+    # profile) of which two are query-dependent, so 128 covers ~64 unique
+    # queries per active session — well above any realistic hot window
+    # while keeping memory growth bounded for marathon sessions.
+    HOT_CACHE_MAX_ENTRIES = 128
+
+    def hot_cache_get(self, key: str) -> Optional[object]:
+        """Return the cached value for ``key`` if present, else ``None``.
+
+        Reads bump the entry to the most-recently-used end so the LRU
+        eviction policy reflects access patterns, not just insertion
+        order. No age-based expiry: callers control invalidation via
+        ``clear_hot_cache``, ``invalidate_warm_profile``, or new-
+        conversation reset in the engine.
+        """
+        with self._lock:
+            entry = self._hot_cache.get(key)
+            if not entry:
+                return None
+            self._hot_cache.move_to_end(key)
+            _ts, value = entry
+            return value
+
+    def hot_cache_put(self, key: str, value: object) -> None:
+        """Store value under key with current timestamp.
+
+        Evicts the least-recently-used entry once ``HOT_CACHE_MAX_ENTRIES``
+        is exceeded so per-query keys (router/enrichment caches) cannot
+        grow without bound during long sessions.
+        """
+        with self._lock:
+            self._hot_cache[key] = (time.time(), value)
+            self._hot_cache.move_to_end(key)
+            while len(self._hot_cache) > self.HOT_CACHE_MAX_ENTRIES:
+                self._hot_cache.popitem(last=False)
+
+    def clear_hot_cache(self) -> None:
+        """Drop all conversation-scoped cache entries."""
+        with self._lock:
+            self._hot_cache = OrderedDict()
+
+    def invalidate_warm_profile(self) -> None:
+        """Drop the cached warm-profile block. Called from the graph
+        mutation listener so a mid-conversation User/Directives change
+        is reflected on the very next turn.
+        """
+        with self._lock:
+            self._hot_cache.pop(self.WARM_PROFILE_CACHE_KEY, None)
+
+    def get_recent_turns_with_tools(
+        self,
+        max_tool_turns: int = 2,
+        per_entry_chars: int = 1200,
+    ) -> List[dict]:
+        """Like `get_recent_messages`, but interleaves stored tool turns in
+        timestamp order. Only the most recent `max_tool_turns` tool groups
+        survive; older ones are dropped wholesale (avoids orphan
+        assistant-with-tool_calls without a matching tool result, which would
+        break native tool calling).
+        """
+        with self._lock:
+            if not self._messages and not self._tool_turns:
+                return []
+            cutoff = time.time() - self.RECENT_WINDOW_SEC
+            # Build timeline of (ts, payload) where payload is either a single
+            # text message dict or a list of tool messages.
+            timeline: list = []
+            for ts, role, content in self._messages:
+                if ts >= cutoff:
+                    timeline.append((ts, "msg", {"role": role, "content": content}))
+            # Keep only the last N tool turns. Tool carryover lives for
+            # the conversation, not for RECENT_WINDOW_SEC: an active session
+            # past the window still benefits from the prior tool result.
+            # The engine clears ``_tool_turns`` on new-conversation entry.
+            for ts, msgs in self._tool_turns[-max_tool_turns:]:
+                truncated: list[dict] = []
+                for m in msgs:
+                    mm = dict(m)
+                    c = mm.get("content")
+                    if isinstance(c, str) and len(c) > per_entry_chars:
+                        cut = c[:per_entry_chars].rstrip() + "…"
+                        # If truncation sliced away the closing marker of an
+                        # UNTRUSTED WEB EXTRACT fence, re-append it so the
+                        # injection-defence fence stays intact downstream.
+                        if (
+                            _UNTRUSTED_FENCE_BEGIN in cut
+                            and _UNTRUSTED_FENCE_END not in cut
+                        ):
+                            cut = cut + "\n" + _UNTRUSTED_FENCE_END
+                        mm["content"] = cut
+                    truncated.append(mm)
+                timeline.append((ts, "group", truncated))
+            timeline.sort(key=lambda t: t[0])
+            flat: List[dict] = []
+            for _, kind, payload in timeline:
+                if kind == "msg":
+                    flat.append(payload)
+                else:
+                    flat.extend(payload)
+            return flat
+
+    def has_recent_messages(self) -> bool:
+        """Check if there are any messages in the last 5 minutes."""
+        with self._lock:
+            cutoff = time.time() - self.RECENT_WINDOW_SEC
+            return any(ts >= cutoff for ts, _, _ in self._messages)
+
+    def set_last_profile(self, profile: str) -> None:
+        """Track the last profile used for follow-up detection."""
+        with self._lock:
+            self._last_profile = profile
+
+    def get_last_profile(self) -> Optional[str]:
+        """Get the last profile used, if within the recent window."""
+        with self._lock:
+            # Only return profile if we have recent messages
+            cutoff = time.time() - self.RECENT_WINDOW_SEC
+            if any(ts >= cutoff for ts, _, _ in self._messages):
+                return self._last_profile
+            return None
+
+    # Compatibility and diary functionality
+    def add_interaction(self, user_text: str, assistant_text: str) -> None:
+        """Compatibility method - use add_message() instead."""
+        if user_text.strip():
+            self.add_message("user", user_text.strip())
+        if assistant_text.strip():
+            self.add_message("assistant", assistant_text.strip())
+
+    def get_pending_chunks(self) -> List[str]:
+        """Get unsaved messages as formatted chunks for diary update.
+
+        Returns messages that haven't been saved to diary yet
+        (timestamp > _last_saved_timestamp). Thread-safe.
+
+        For diary flush callers that need an atomic snapshot timestamp,
+        use ``get_pending_chunks_with_snapshot()`` instead — this method
+        discards the snapshot and is intended for display/notification
+        purposes only.
+        """
+        chunks, _ = self.get_pending_chunks_with_snapshot()
+        return chunks
+
+    def get_pending_chunks_with_snapshot(self) -> Tuple[List[str], float]:
+        """Return (pending_chunks, snapshot_timestamp) atomically.
+
+        The snapshot is ``_last_ts`` — the highest timestamp assigned by
+        ``_next_ts`` so far. Because ``_next_ts`` is strictly monotonic,
+        every ``add_message`` call after this lock is released will produce
+        a timestamp strictly greater than the snapshot. Callers should pass
+        the returned snapshot to ``mark_saved_up_to`` rather than computing
+        their own ``time.time()`` snapshot, which can collide with ``_next_ts``
+        on low-resolution clocks (Windows ~16ms tick).
+        """
+        with self._lock:
+            unsaved_messages = [
+                (ts, role, content) for ts, role, content in self._messages
+                if ts > self._last_saved_timestamp
+            ]
+            chunks = [f"{role.title()}: {content}" for _, role, content in unsaved_messages]
+            return chunks, self._last_ts
+
+    def has_pending_chunks(self) -> bool:
+        """Check if there are unsaved messages. Thread-safe."""
+        with self._lock:
+            return any(ts > self._last_saved_timestamp for ts, _, _ in self._messages)
+
+    def should_update_diary(self) -> bool:
+        """Check if diary should be updated based on inactivity timeout.
+
+        Returns True if:
+        1. There are unsaved messages AND user has been inactive for inactivity_timeout, OR
+        2. There are unsaved messages older than MAX_UNSAVED_AGE_SEC (prevents data loss
+           in very long conversations)
+        """
+        with self._lock:
+            if not self.has_pending_chunks():
+                return False
+
+            current_time = time.time()
+
+            # Standard inactivity check
+            if (current_time - self._last_activity_time) >= self._inactivity_timeout:
+                return True
+
+            # Edge case: very long conversation - force update if old messages exist
+            # This prevents context loss when a conversation exceeds the recent window
+            oldest_unsaved = None
+            for ts, _, _ in self._messages:
+                if ts > self._last_saved_timestamp:
+                    oldest_unsaved = ts
+                    break  # First unsaved message is the oldest
+
+            if oldest_unsaved is not None:
+                unsaved_age = current_time - oldest_unsaved
+                if unsaved_age >= self.MAX_UNSAVED_AGE_SEC:
+                    return True
+
+            return False
+
+    def mark_saved_up_to(self, timestamp: float) -> None:
+        """Mark all messages up to the given timestamp as saved.
+
+        Thread-safe. Also cleans up old messages that have been saved.
+        """
+        with self._lock:
+            self._last_saved_timestamp = max(self._last_saved_timestamp, timestamp)
+            self._cleanup_old_messages()
+
+    def _cleanup_old_messages(self) -> None:
+        """Remove messages that are both saved and older than the recent window.
+
+        Must be called while holding the lock.
+        """
+        current_time = time.time()
+        # Keep messages that are either:
+        # 1. Recent (within RECENT_WINDOW_SEC) - needed for LLM context
+        # 2. Not yet saved (timestamp > _last_saved_timestamp) - needed for diary
+        cutoff = current_time - self.RECENT_WINDOW_SEC
+        self._messages = [
+            (ts, role, content) for ts, role, content in self._messages
+            if ts >= cutoff or ts > self._last_saved_timestamp
+        ]
+
+    def clear_pending_updates(self) -> None:
+        """Mark all current messages as saved. Thread-safe.
+
+        DEPRECATED: Use mark_saved_up_to() instead for proper timestamp tracking.
+        Kept for backward compatibility.
+        """
+        with self._lock:
+            if self._messages:
+                # Mark all current messages as saved
+                max_ts = max(ts for ts, _, _ in self._messages)
+                self._last_saved_timestamp = max_ts
+            self._cleanup_old_messages()
+
+
+def generate_conversation_summary(
+    recent_chunks: List[str],
+    previous_summary: Optional[str],
+    ollama_base_url: str,
+    ollama_chat_model: str,
+    timeout_sec: float = 30.0,
+    on_token: Optional[Callable[[str], None]] = None,
+    thinking: bool = False,
+) -> Tuple[str, str]:
+    """
+    Generate a concise conversation summary from recent chunks and previous summary.
+
+    Args:
+        recent_chunks: List of conversation chunks to summarise
+        previous_summary: Previous summary for today (if any)
+        ollama_base_url: Ollama API base URL
+        ollama_chat_model: Model to use
+        timeout_sec: Request timeout
+        on_token: Optional callback for streaming tokens (for live UI updates)
+
+    Returns:
+        Tuple of (summary, topics) where topics is comma-separated
+    """
+    from ..llm import call_llm_direct, call_llm_streaming
+
+    chunks_text = "\n".join(recent_chunks[-10:])  # Last 10 chunks to keep context manageable
+
+    system_prompt = """You are a conversation summariser for a personal AI assistant. Your job is to create concise daily summaries of conversations that will be stored in a diary for future reference.
+
+Create a summary that:
+1. Captures the key topics discussed and important information shared
+2. Is concise but informative (max 200 words)
+3. Focuses on facts, decisions, and context that would be useful for future conversations
+4. Includes any personal information, preferences, or important events mentioned
+5. Maintains a neutral, factual tone
+6. CRITICAL — never narrate the assistant's own failures, deflections, hesitations, or limitations. The diary records what the user shared and what was established as true. The assistant's own missteps are conversational noise. If preserved, they are retrieved by future sessions as "history" and prime the model to repeat the same failure.
+
+   Drop EVERY sentence whose subject is the assistant and whose verb describes inability, deflection, or non-knowledge. This includes (and is not limited to):
+   - "the assistant could not / couldn't / cannot / can't / was not able / was unable / failed to …"
+   - "the assistant did not / didn't / does not / doesn't have / know / find / access …"
+   - "the assistant said / noted / explained / stated / clarified / acknowledged / admitted / apologised that it could not / cannot / didn't / does not / had no / lacked …"
+   - "the assistant offered to search / help / look / check, suggested checking, recommended consulting …"
+   - "the assistant lacks / has no / had no information / details / access / knowledge …"
+   - any equivalent phrasing in ANY other language describing the assistant's inability, uncertainty, or offer to help.
+
+   If you find yourself about to write such a sentence, do not write it. Just omit it. The diary is shorter — that is correct.
+
+   - If the assistant eventually answered (e.g. after calling a tool), summarise the FINAL answer only.
+   - If the topic was raised but never resolved, record only the topic and the user's intent — strip every phrase about the assistant's inability, uncertainty, or offer to help.
+
+   English — what NOT to write:
+     BAD: "The user asked about the book Piranesi. The assistant stated it did not have specific information."
+     BAD: "The user wanted travel info. The assistant said it couldn't access live data."
+     BAD: "The user asked for a recipe. The assistant offered to search the web."
+     BAD: "The user asked about a venue. The assistant failed to find anything."
+   English — correct output:
+     GOOD: "The user asked about the book Piranesi."
+     GOOD: "The user wanted travel info."
+     GOOD: "The user asked for a recipe."
+     GOOD: "The user asked about a venue."
+
+   Turkish — what NOT to write:
+     KÖTÜ: "Kullanıcı bir restoran sordu. Asistan o konuda bilgisi olmadığını söyledi."
+   Turkish — correct:
+     İYİ: "Kullanıcı bir restoran sordu."
+
+   Spanish — what NOT to write:
+     MAL: "El usuario preguntó por una película. El asistente dijo que no tenía información."
+   Spanish — correct:
+     BIEN: "El usuario preguntó por una película."
+
+   This rule has no exceptions and applies in every language.
+7. CRITICAL attribution rule — record what was SAID faithfully, but make clear WHO said it. The diary is a log of the conversation, not a fact sheet, so preserve the actual content (including the assistant's answers, because a later session may need them — and because the user may later correct a wrong answer, and we want the whole chain on record). What must not happen is quietly promoting an assistant claim into an unattributed fact, because the assistant may hallucinate.
+   - When the assistant states something about a third-party entity (film, book, product, company, person, place, event, scientific fact, definition), always attribute it in the summary: write "the assistant said/stated/explained X" rather than "X". The attribution lets downstream readers treat the claim with appropriate skepticism.
+   - Never paraphrase an attributed claim into an unattributed assertion. "The assistant said Possessor is a 2006 film by Brandon Cronenberg" is fine (attribution preserved). "Possessor is a 2006 film by Brandon Cronenberg" is NOT (attribution stripped — now reads as established fact).
+   - If the user later corrects the assistant, record both: the initial claim AND the correction. That's how the final state becomes recoverable — never delete earlier claims when a correction comes in.
+   - Weather, time, location, calculator results, and other clearly tool-grounded data can be recorded as fact without attribution caveats — the tool output is the authority.
+   - User-stated facts about themselves (preferences, biography, plans, decisions) are always safe to record verbatim as user facts.
+
+   Example — attributed assistant claim (preserves information, flags provenance):
+     GOOD: "The user asked about the movie Possessor; the assistant said it is a 2006 science fiction film directed by Brandon Cronenberg."
+     BAD (unattributed — reads as established fact, will poison downstream): "The user asked about the movie Possessor. It is a 2006 science fiction film directed by Brandon Cronenberg."
+
+   Example — correction chain preserved:
+     GOOD: "The user asked about Possessor; the assistant said it is a 2006 film, the user corrected that it is from 2020."
+
+   Example — tool-grounded + user-stated, no attribution caveats needed:
+     OK: "The weather in Hackney was 10.6°C and partly cloudy. The user said they prefer Thai over Indian food."
+
+   This rule applies in any language.
+8. CRITICAL topic-separation rule — do NOT weld unrelated topics into one grammatical clause. If the conversation covered two distinct subjects (e.g. a film and a person, a recipe and a weather query, two different named entities), write a separate sentence for each, each with its own subject and verb. A welded clause reads to downstream retrievers — and to other LLMs enriching future replies — as a single claim about both referents, and silently corrupts the record.
+   - One topic per sentence. Never join two unrelated topics with "and", a shared appositive, or a shared relative clause.
+   - Never let an appositive or relative clause dangle over more than one topic. "X and Y, identified as Z" reads as Z describing both X and Y — this is the exact failure mode.
+
+   Example — two distinct topics raised in the same conversation (a film, and the name "Jarvis" meaning the MCU character). The BAD version welded them so downstream readers treated the MCU description as pertaining to the film:
+     BAD: "The conversation focused on the movie Possessor and the character Jarvis, identified as the artificial intelligence from the Marvel Cinematic Universe, created by Tony Stark and later embodied by Vision."
+     GOOD: "The user asked about the movie Possessor; the assistant said it is a 2020 science-fiction horror film directed by Brandon Cronenberg. Separately, the user asked about the name Jarvis; the assistant said the MCU character Jarvis is an AI created by Tony Stark and later embodied by Vision."
+
+   This rule applies in any language.
+
+Also extract 3-5 main topics as comma-separated keywords."""
+
+    if previous_summary:
+        user_prompt = f"""Previous summary for today: {previous_summary}
+
+Recent conversation chunks:
+{chunks_text}
+
+Update the summary to include the new information. Provide:
+1. Updated summary (max 200 words)
+2. Main topics (comma-separated)
+
+Format your response as:
+SUMMARY: [your summary here]
+TOPICS: [topic1, topic2, topic3]"""
+    else:
+        user_prompt = f"""Conversation chunks from today:
+{chunks_text}
+
+Create a summary of today's conversations. Provide:
+1. Summary (max 200 words)
+2. Main topics (comma-separated)
+
+Format your response as:
+SUMMARY: [your summary here]
+TOPICS: [topic1, topic2, topic3]"""
+
+    try:
+        # Use streaming if callback provided, otherwise use direct call
+        if on_token:
+            response = call_llm_streaming(
+                ollama_base_url, ollama_chat_model, system_prompt, user_prompt,
+                on_token=on_token, timeout_sec=timeout_sec, thinking=thinking,
+            )
+        else:
+            response = call_llm_direct(
+                ollama_base_url, ollama_chat_model, system_prompt, user_prompt,
+                timeout_sec=timeout_sec, thinking=thinking,
+            )
+
+        if not response:
+            # No fallback - if LLM fails to respond, skip summarization
+            return None, None
+
+        # Parse the response
+        lines = response.strip().split('\n')
+        summary = ""
+        topics = ""
+
+        for line in lines:
+            if line.startswith("SUMMARY:"):
+                summary = line[8:].strip()
+            elif line.startswith("TOPICS:"):
+                topics = line[7:].strip()
+
+        # No fallback - if parsing fails, skip summarization
+        if not summary or not topics:
+            return None, None
+
+        return summary, topics
+
+    except Exception:
+        # No fallback - if LLM fails, skip summarization entirely
+        return None, None
+
+
+def update_daily_conversation_summary(
+    db: Database,
+    new_chunks: List[str],
+    ollama_base_url: str,
+    ollama_chat_model: str,
+    ollama_embed_model: str,
+    source_app: str = "jarvis",
+    voice_debug: bool = False,
+    timeout_sec: float = 30.0,
+    on_token: Optional[Callable[[str], None]] = None,
+    thinking: bool = False,
+) -> Optional[int]:
+    """
+    Update the conversation summary for today with new chunks.
+
+    Args:
+        on_token: Optional callback for streaming tokens (for live UI updates)
+
+    Returns the summary ID if successful, None otherwise.
+    """
+    if not new_chunks:
+        return None
+
+    today = datetime.now(timezone.utc).date().isoformat()  # YYYY-MM-DD format
+
+    try:
+        # Redact sensitive information from chunks before processing
+        from ..utils.redact import redact
+        redacted_chunks = [redact(chunk) for chunk in new_chunks]
+
+        # Debug: Log the redacted chunks being processed
+        debug_log(f"updating conversation memory with {len(redacted_chunks)} new chunks:", "memory")
+        for i, chunk in enumerate(redacted_chunks):
+            chunk_preview = chunk[:100] + "..." if len(chunk) > 100 else chunk
+            debug_log(f"  chunk {i+1}: {chunk_preview}", "memory")
+
+        # Get existing summary for today
+        existing = db.get_conversation_summary(today, source_app)
+        previous_summary = existing['summary'] if existing else None
+
+        # Generate updated summary using redacted chunks
+        summary, topics = generate_conversation_summary(
+            redacted_chunks, previous_summary, ollama_base_url, ollama_chat_model,
+            timeout_sec=timeout_sec, on_token=on_token, thinking=thinking,
+        )
+
+        # Skip summarization if LLM failed
+        if summary is None or topics is None:
+            debug_log("conversation summary skipped - LLM failed to generate summary", "memory")
+            return  # Skip summarization entirely
+
+        # Debug: Log the generated summary and topics
+        summary_preview = summary[:200] + "..." if len(summary) > 200 else summary
+        debug_log("conversation memory updated to:", "memory")
+        debug_log(f"  summary: {summary_preview}", "memory")
+        debug_log(f"  topics: {topics}", "memory")
+        if previous_summary:
+            prev_preview = previous_summary[:100] + "..." if len(previous_summary) > 100 else previous_summary
+            debug_log(f"  previous summary: {prev_preview}", "memory")
+        else:
+            debug_log("  previous summary: (none)", "memory")
+
+        # Store the summary
+        summary_id = db.upsert_conversation_summary(
+            date_utc=today,
+            summary=summary,
+            topics=topics,
+            source_app=source_app,
+        )
+
+        # Generate and store embedding for semantic search
+        if db.is_vss_enabled:
+            # Combine summary and topics for embedding
+            text_for_embedding = f"{summary} {topics}"
+            vec = get_embedding(text_for_embedding, ollama_base_url, ollama_embed_model, timeout_sec=15.0)  # Use shorter timeout for embeddings
+            if vec is not None:
+                db.upsert_summary_embedding(summary_id, vec)
+
+        return summary_id
+
+    except Exception:
+        return None
+
+
+def search_conversation_memory_by_keywords(
+    db: Database,
+    keywords: List[str],
+    from_time: Optional[str] = None,
+    to_time: Optional[str] = None,
+    ollama_base_url: Optional[str] = None,
+    ollama_embed_model: Optional[str] = None,
+    timeout_sec: float = 60.0,
+    voice_debug: bool = False,
+    max_results: int = 10,
+) -> List[str]:
+    """
+    Search conversation memory using multiple keywords with OR logic.
+    This is optimised for memory enrichment where we have extracted topic keywords.
+
+    Args:
+        db: Database instance
+        keywords: List of keywords to search for (will be OR'd together)
+        from_time: Start timestamp (ISO format)
+        to_time: End timestamp (ISO format)
+        ollama_base_url: Base URL for embeddings
+        ollama_embed_model: Model for embeddings
+        timeout_sec: Timeout for embedding generation
+        voice_debug: Enable debug output
+        max_results: Maximum number of results to return (default: 10)
+
+    Returns:
+        List of formatted context strings (limited to max_results)
+    """
+    contexts = []
+
+    if not keywords:
+        return contexts
+
+    # Clean keywords
+    clean_keywords = [k.strip() for k in keywords if k and k.strip()]
+    if not clean_keywords:
+        return contexts
+
+    try:
+        debug_log(f"      🔍 Keyword-based search for: {clean_keywords}", "memory")
+
+        # Build FTS OR query for better recall
+        fts_query = " OR ".join(clean_keywords[:5])  # Limit to 5 keywords
+
+        # For embedding, combine keywords to get semantic meaning of the topic cluster
+        embed_query = " ".join(clean_keywords)
+
+        debug_log(f"      📝 FTS query: '{fts_query}'", "memory")
+        debug_log(f"      📝 Embed query: '{embed_query}'", "memory")
+
+        if ollama_base_url and ollama_embed_model:
+            try:
+                vec = get_embedding(embed_query, ollama_base_url, ollama_embed_model, timeout_sec=timeout_sec)
+                vec_json = json.dumps(vec) if vec is not None else None
+
+                if vec_json:
+                    # Hybrid search with OR query for FTS and combined embedding
+                    search_results = db.search_hybrid(fts_query, vec_json, top_k=max_results)
+                else:
+                    # Fallback: FTS-only with OR query
+                    search_results = db.search_hybrid(fts_query, None, top_k=max_results)
+            except Exception as e:
+                debug_log(f"      ❌ Embedding failed, using FTS only: {e}", "memory")
+                # Fallback to FTS-only
+                search_results = db.search_hybrid(fts_query, None, top_k=max_results)
+        else:
+            # No embedding service available, use FTS-only
+            search_results = db.search_hybrid(fts_query, None, top_k=max_results)
+
+        # Collect results with scores and dates for recency-aware ordering
+        scored_results: list[tuple[float, str, str]] = []  # (score, date, text)
+        for result in search_results:
+            if isinstance(result, dict):
+                result_text = result.get('text', '')
+                score = result.get('score', 0.0)
+            else:
+                result_text = result[2] if len(result) > 2 else ''
+                score = result[1] if len(result) > 1 else 0.0
+            if isinstance(result_text, str) and result_text:
+                # Extract date from "[YYYY-MM-DD] ..." prefix for recency tiebreaking
+                date_str = result_text[1:11] if result_text.startswith('[') and len(result_text) > 11 else ''
+                scored_results.append((float(score) if score else 0.0, date_str, result_text))
+
+        # Sort newest-first so recency-superseding works at the injection site:
+        # when two entries disagree, the model sees the newer one first and the
+        # preamble in the reply engine tells it to treat the newer entry as the
+        # user's current understanding. Fall back to relevance score as tiebreak.
+        scored_results.sort(key=lambda x: (x[1], x[0]), reverse=True)
+        contexts = [text for _, _, text in scored_results]
+
+        debug_log(f"      ✅ found {len(contexts)} keyword search results", "memory")
+        if contexts:
+            # Show preview of first result
+            preview = contexts[0][:150] + "..." if len(contexts[0]) > 150 else contexts[0]
+            debug_log(f"      📋 First result: {preview}", "memory")
+
+    except Exception as e:
+        debug_log(f"keyword search failed: {e}", "memory")
+
+    # Apply time filtering if needed
+    if from_time or to_time:
+        contexts = _filter_contexts_by_time(contexts, from_time, to_time, voice_debug)
+
+    return contexts[:max_results]
+
+
+def search_conversation_memory(
+    db: Database,
+    search_query: Optional[str] = None,
+    from_time: Optional[str] = None,
+    to_time: Optional[str] = None,
+    ollama_base_url: Optional[str] = None,
+    ollama_embed_model: Optional[str] = None,
+    timeout_sec: float = 60.0,
+    voice_debug: bool = False,
+    max_results: int = 15,
+) -> List[str]:
+    """
+    Search conversation memory with a natural language query or phrase.
+    This is optimised for direct user queries and tool usage.
+
+    Args:
+        db: Database instance
+        search_query: Natural language query or phrase to search for
+        from_time: Start timestamp (ISO format)
+        to_time: End timestamp (ISO format)
+        ollama_base_url: Base URL for embeddings (required if search_query provided)
+        ollama_embed_model: Model for embeddings (required if search_query provided)
+        timeout_sec: Timeout for embedding generation
+        voice_debug: Enable debug output
+        max_results: Maximum number of results to return (default: 15)
+
+    Returns:
+        List of formatted context strings (limited to max_results)
+    """
+    contexts = []
+
+    try:
+        if search_query and search_query.strip() and ollama_base_url and ollama_embed_model:
+            # Primary: Use vector search for semantic similarity
+            try:
+                vec = get_embedding(search_query, ollama_base_url, ollama_embed_model, timeout_sec=timeout_sec)
+                vec_json = json.dumps(vec) if vec is not None else None
+
+                if vec_json:
+                    # Use database hybrid search (combines vector similarity with FTS)
+                    search_results = db.search_hybrid(search_query, vec_json, top_k=max_results)
+                else:
+                    # Fallback: Pure FTS if embedding fails
+                    search_results = db.search_hybrid(search_query, None, top_k=max_results)
+
+                # Add search results to context
+                for result in search_results:
+                    # Handle both tuple (sqlite-vss) and dict (python vector store) results
+                    if isinstance(result, dict):
+                        result_text = result.get('text', '')
+                    else:
+                        result_text = result[2] if len(result) > 2 else ''
+                    if isinstance(result_text, str) and result_text:
+                        contexts.append(result_text)
+
+            except Exception as e:
+                if voice_debug:
+                    debug_log(f"memory search failed: {e}", "memory")
+
+        # Apply time filtering if provided
+        debug_log(f"      📋 Checking time filtering: from_time={from_time}, to_time={to_time}", "memory")
+
+        if from_time or to_time:
+            filtered_contexts = []
+            from_dt = None
+            to_dt = None
+
+            try:
+                if from_time:
+                    from_dt = datetime.fromisoformat(from_time.replace('Z', '+00:00'))
+                if to_time:
+                    to_dt = datetime.fromisoformat(to_time.replace('Z', '+00:00'))
+            except Exception as e:
+                debug_log(f"      📋 Error parsing time: {e}", "memory")
+
+            debug_log(f"      📋 Time filtering: search_query='{search_query}', from_dt={from_dt}, to_dt={to_dt}", "memory")
+
+            # If we have time constraints but no search query, get all summaries in range
+            if (not search_query or not search_query.strip()) and (from_dt or to_dt):
+                recent_summaries = db.get_recent_conversation_summaries(days=30)
+                debug_log(f"      📋 Time filter: from={from_dt.date() if from_dt else None} to={to_dt.date() if to_dt else None}", "memory")
+                debug_log(f"      📋 Found {len(recent_summaries)} summaries to check", "memory")
+
+                for summary_row in recent_summaries:
+                    date_str = summary_row['date_utc']
+                    summary_date = datetime.fromisoformat(date_str + 'T00:00:00+00:00')
+
+                    in_range = True
+                    if from_dt and summary_date.date() < from_dt.date():
+                        in_range = False
+                        debug_log(f"      📋 Skipping {date_str}: before from_dt", "memory")
+                    if to_dt and summary_date.date() > to_dt.date():
+                        in_range = False
+                        debug_log(f"      📋 Skipping {date_str}: after to_dt", "memory")
+
+                    if in_range:
+                        summary_text = summary_row['summary']
+                        topics = summary_row['topics'] or ""
+                        context_str = f"[{date_str}] {summary_text}"
+                        if topics:
+                            context_str += f" (Topics: {topics})"
+                        contexts.append(context_str)
+                        debug_log(f"      📋 Including summary from {date_str} (length: {len(summary_text)})", "memory")
+
+            else:
+                # Filter existing search results by time
+                import re
+                for ctx in contexts:
+                    if ctx.startswith("---"):  # Skip headers
+                        filtered_contexts.append(ctx)
+                        continue
+
+                    # Extract date from formatted text
+                    date_match = re.match(r'\[(\d{4}-\d{2}-\d{2})\]', ctx)
+                    if date_match:
+                        date_str = date_match.group(1)
+                        try:
+                            summary_date = datetime.fromisoformat(date_str + 'T00:00:00+00:00')
+
+                            in_range = True
+                            if from_dt and summary_date < from_dt:
+                                in_range = False
+                            if to_dt and summary_date > to_dt:
+                                in_range = False
+
+                            if in_range:
+                                filtered_contexts.append(ctx)
+                        except Exception:
+                            filtered_contexts.append(ctx)  # Keep if can't parse date
+                    else:
+                        filtered_contexts.append(ctx)  # Keep non-dated entries
+
+                contexts = filtered_contexts
+
+        return contexts[:max_results]  # Limit results
+
+    except Exception:
+        return contexts[:max_results] if contexts else []
+
+
+def get_relevant_conversation_context(
+    db: Database,
+    query: str,
+    ollama_base_url: str,
+    ollama_embed_model: str,
+    timeout_sec: float = 60.0,
+    max_results: int = 15,
+) -> List[str]:
+    """
+    Get relevant conversation summaries that might provide context for the current query.
+
+    Returns list of formatted context strings.
+
+    This is a wrapper around search_conversation_memory for backward compatibility.
+    """
+    return search_conversation_memory(
+        db=db,
+        search_query=query,
+        ollama_base_url=ollama_base_url,
+        ollama_embed_model=ollama_embed_model,
+        timeout_sec=timeout_sec,
+        voice_debug=False,
+        max_results=max_results
+    )
+
+
+def update_diary_from_dialogue_memory(
+    db: Database,
+    dialogue_memory: DialogueMemory,
+    ollama_base_url: str,
+    ollama_chat_model: str,
+    ollama_embed_model: str,
+    source_app: str = "jarvis",
+    voice_debug: bool = False,
+    timeout_sec: float = 30.0,
+    force: bool = False,
+    on_token: Optional[Callable[[str], None]] = None,
+    thinking: bool = False,
+    graph_picker_model: Optional[str] = None,
+) -> Optional[int]:
+    """
+    Update the diary with pending interactions from dialogue memory.
+
+    Thread-safe: captures the timestamp of messages being processed before
+    LLM summarization starts, so new messages arriving during summarization
+    won't be incorrectly marked as saved.
+
+    Args:
+        on_token: Optional callback for streaming tokens (for live UI updates)
+
+    Returns the summary ID if successful, None otherwise.
+    """
+    debug_log(f"update_diary_from_dialogue_memory called: force={force}", "memory")
+
+    if not force and not dialogue_memory.should_update_diary():
+        debug_log("diary update skipped: should_update_diary=False and force=False", "memory")
+        return None
+
+    try:
+        # Atomically capture pending chunks AND the snapshot timestamp.
+        # Using ``_last_ts`` (via get_pending_chunks_with_snapshot) rather
+        # than a bare ``time.time()`` call guarantees that the snapshot is
+        # strictly before any future ``add_message`` call, regardless of
+        # OS clock granularity. On Windows ``time.time()`` has ~16ms
+        # resolution, so a separate ``time.time()`` snapshot and the
+        # ``_next_ts`` call inside a concurrent ``add_message`` can both
+        # land on the same tick, producing identical timestamps. The new
+        # message then fails the ``ts > snapshot`` test in
+        # ``get_pending_chunks`` and is wrongly treated as already saved.
+        pending_chunks, snapshot_timestamp = (
+            dialogue_memory.get_pending_chunks_with_snapshot()
+        )
+        debug_log(f"diary update: got {len(pending_chunks)} pending chunks from dialogue_memory", "memory")
+
+        if not pending_chunks:
+            debug_log("diary update skipped: no pending chunks in dialogue_memory", "memory")
+            return None
+
+        # Update the daily conversation summary
+        # This is the slow operation (LLM call) during which new messages might arrive
+        debug_log("calling update_daily_conversation_summary...", "memory")
+        summary_id = update_daily_conversation_summary(
+            db=db,
+            new_chunks=pending_chunks,
+            ollama_base_url=ollama_base_url,
+            ollama_chat_model=ollama_chat_model,
+            ollama_embed_model=ollama_embed_model,
+            source_app=source_app,
+            voice_debug=voice_debug,
+            timeout_sec=timeout_sec,
+            on_token=on_token,
+            thinking=thinking,
+        )
+
+        debug_log(f"update_daily_conversation_summary returned: {summary_id}", "memory")
+
+        # Mark only the messages that existed at snapshot time as saved
+        # New messages that arrived during summarization remain pending
+        if summary_id is not None:
+            dialogue_memory.mark_saved_up_to(snapshot_timestamp)
+            debug_log(f"marked messages saved up to timestamp {snapshot_timestamp}", "memory")
+
+            # Graph memory (v2): extract facts and store in the node graph.
+            # Non-blocking — if this fails, the diary update still succeeded.
+            # Uses a dedicated timeout (30s) rather than the diary chat timeout,
+            # so graph updates don't inflate the diary flush wall time.
+            try:
+                from .graph import GraphMemoryStore
+                from .graph_ops import update_graph_from_dialogue
+
+                graph_store = GraphMemoryStore(db.db_path)
+                # Retrieve the summary we just stored to use for extraction
+                today = datetime.now(timezone.utc).date().isoformat()
+                existing = db.get_conversation_summary(today, source_app)
+                summary_text = existing['summary'] if existing else None
+
+                if summary_text:
+                    # Use a shorter timeout for graph operations — extraction (30s),
+                    # placement (15s/fact), and split (45s) each have their own budgets
+                    # inside update_graph_from_dialogue.
+                    graph_timeout = min(timeout_sec, 30.0)
+                    result = update_graph_from_dialogue(
+                        store=graph_store,
+                        summary=summary_text,
+                        ollama_base_url=ollama_base_url,
+                        ollama_chat_model=ollama_chat_model,
+                        timeout_sec=graph_timeout,
+                        thinking=thinking,
+                        date_utc=today,
+                        picker_model=graph_picker_model,
+                    )
+                    stored = result.stored
+                    skipped = result.skipped
+                    # Print whenever extraction produced anything — including
+                    # all-duplicate flushes. Without the skipped count this
+                    # line went silent after #282's dedupe (cumulative diary
+                    # re-extracts the same facts on every flush), making it
+                    # look like the memory pipeline had stopped working.
+                    if stored or skipped:
+                        dup_suffix = (
+                            f"{skipped} duplicate{'' if skipped == 1 else 's'} skipped"
+                        )
+                        if stored:
+                            fact_count = (
+                                f"{len(stored)} new fact"
+                                f"{'' if len(stored) == 1 else 's'}"
+                            )
+                            tail = f" ({dup_suffix})" if skipped else ""
+                            print(
+                                f"  🧠 Knowledge graph: learned {fact_count}{tail}",
+                                flush=True,
+                            )
+                            # Show each new fact with the node it landed in so
+                            # the user can eyeball extraction/placement. Cap
+                            # preview length per fact.
+                            for fact, node_name in stored[:6]:
+                                preview = fact.replace("\n", " ").strip()
+                                if len(preview) > 90:
+                                    preview = preview[:90].rstrip() + "…"
+                                print(f"     · {preview} → {node_name}", flush=True)
+                            if len(stored) > 6:
+                                print(f"     · …and {len(stored) - 6} more", flush=True)
+                        else:
+                            print(
+                                f"  🧠 Knowledge graph: nothing new ({dup_suffix})",
+                                flush=True,
+                            )
+                    debug_log(
+                        f"graph memory: stored {len(stored)} facts, "
+                        f"{skipped} duplicates skipped",
+                        "memory",
+                    )
+            except Exception as e:
+                debug_log(f"graph memory update failed (non-fatal): {e}", "memory")
+
+        return summary_id
+
+    except Exception as e:
+        debug_log(f"update_diary_from_dialogue_memory error: {e}", "memory")
+        return None

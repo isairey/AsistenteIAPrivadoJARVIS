@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ "${SKIP_TESTS:-}" = "1" ]; then
+  echo "[pre-push] SKIP_TESTS=1 -> skipping unit tests"
+  exit 0
+fi
+
+echo "[pre-push] Running all tests (unit, integration, and e2e)"
+
+# Prefer python -m pytest to avoid PATH issues
+if ! command -v python >/dev/null 2>&1; then
+  echo "[pre-push] python not found on PATH; skipping tests"
+  exit 0
+fi
+
+if ! python -c "import pytest" >/dev/null 2>&1; then
+  echo "[pre-push] pytest not installed; skipping tests"
+  exit 0
+fi
+
+# Run all tests for comprehensive validation before push
+if ! python -m pytest -q; then
+  echo "[pre-push] Tests failed. Aborting push."
+  exit 1
+fi
+
+echo "[pre-push] All tests passed"
+exit 0
+
+

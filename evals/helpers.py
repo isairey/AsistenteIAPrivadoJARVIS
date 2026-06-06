@@ -1,0 +1,652 @@
+"""
+Helper functions and data classes for eval tests.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Callable, Tuple
+import os
+
+
+# LLM-as-judge / model-under-test configuration.
+#
+# This single knob does double duty: it's both the model the eval uses as
+# the chat LLM being tested AND the judge used to assess open-ended
+# responses. Field failures on the production default surface here first,
+# so the default MUST match what users actually run — which is the smallest
+# supported model in the README ("gemma4:e2b"), not the largest we
+# internally test against. Opt into larger models with EVAL_JUDGE_MODEL=…
+# when you want a sanity check of the upper tier.
+#
+# Historical note: the default was gpt-oss:20b until 2026-04-20, at which
+# point two field regressions on gemma4:e2b (tool selected but not invoked;
+# native "tool_code" fallback syntax) slipped past CI because the evals
+# were only testing the 20B tier. Defaulting to the small tier is the
+# cheapest way to stop that happening again.
+JUDGE_MODEL = os.environ.get("EVAL_JUDGE_MODEL", "gemma4:e2b")
+JUDGE_BASE_URL = os.environ.get("EVAL_JUDGE_BASE_URL", "http://localhost:11434")
+
+
+# =============================================================================
+# Tool Call Capture
+# =============================================================================
+
+# =============================================================================
+# Fallback-reply detection
+# =============================================================================
+#
+# When the malformed-output guard fires in the reply engine (engine.py), the
+# user gets one of these canned strings. From the user's perspective that is
+# a FAILURE — they asked a question and got a shrug — but historically several
+# evals treated it as neutral because "no malformed text reached the user" is
+# technically true. Treating these strings as test failures turns a silent
+# shield into a loud alarm: if gemma keeps tripping the guard under a given
+# context shape (warm memory, large digest, odd phrasing), the evals will
+# finally flag it.
+#
+# The helper asserts at the call site of an eval rather than globally,
+# because a handful of evals (e.g. `TestMalformedResponseAfterTools` itself)
+# are specifically asserting the fallback fires and must NOT use this helper.
+
+FALLBACK_REPLY_PHRASES = (
+    "i had trouble understanding that request",
+    "i had trouble processing that",
+    "sorry, i had trouble",
+)
+
+
+def is_fallback_reply(response: Optional[str]) -> bool:
+    """Return True when ``response`` is the engine's canned malformed-guard
+    fallback reply — i.e. the user got a shrug instead of an answer."""
+    if not response:
+        return False
+    lowered = response.lower()
+    return any(phrase in lowered for phrase in FALLBACK_REPLY_PHRASES)
+
+
+def assert_not_fallback_reply(response: Optional[str], context: str = "") -> None:
+    """Fail the test when the response is the engine's canned fallback.
+
+    A fallback reply means the malformed-output guard fired — which is a
+    safety net masking an underlying model failure. In most evals, seeing
+    this string means the test SHOULD fail even if the rest of the
+    assertions happen to pass, because the user experience is "the
+    assistant gave up".
+    """
+    import pytest
+
+    if is_fallback_reply(response):
+        prefix = f"[{context}] " if context else ""
+        pytest.fail(
+            f"{prefix}Response is the engine's canned malformed-guard "
+            f"fallback reply — the model produced garbled output and the "
+            f"guard shielded the user. From the user's perspective the "
+            f"assistant gave up. Treat this as a real failure. "
+            f"Response: {(response or '')[:400]}"
+        )
+
+
+# =============================================================================
+# Max-turns digest caveat detection
+# =============================================================================
+#
+# When the agentic loop exhausts ``agentic_max_turns`` without the evaluator
+# ever firing terminal, ``digest_loop_for_max_turns`` in ``enrichment.py``
+# produces a reply whose first sentence is a caveat noting the request was
+# not fully finished (e.g. "I could not fully finish your request…").
+#
+# From the user's perspective that caveat is a FAILURE for simple,
+# single-tool queries — the tool ran, the answer was in hand, and yet the
+# evaluator kept saying "continue" until the turn cap fired the digest
+# summariser. The answer that follows the caveat is typically correct, so
+# naive grounding assertions pass and the regression hides. Treating the
+# caveat as a failure turns that silent shield into a loud alarm for the
+# evaluator's terminal-detection quality.
+#
+# The digest prompt (``_LOOP_DIGEST_SYSTEM_PROMPT`` in
+# ``src/jarvis/reply/enrichment.py``) instructs the LLM to open with a
+# caveat about not finishing. The phrases below are the canonical English
+# shapes that prompt produces; a drift pin test keeps them aligned with
+# the source prompt.
+
+MAX_TURNS_DIGEST_PHRASES = (
+    "could not fully finish",
+    "couldn't fully finish",
+    "was unable to fully finish",
+    "wasn't able to fully finish",
+)
+
+
+def is_max_turns_digest(response: Optional[str]) -> bool:
+    """Return True when ``response`` looks like the max-turns digest
+    caveat — i.e. the agentic loop ran out of turns without the evaluator
+    ever firing terminal."""
+    if not response:
+        return False
+    lowered = response.lower()
+    return any(phrase in lowered for phrase in MAX_TURNS_DIGEST_PHRASES)
+
+
+def assert_not_max_turns_digest(response: Optional[str], context: str = "") -> None:
+    """Fail the test when the response opens with the max-turns digest
+    caveat. For simple single-tool queries, hitting the digest path means
+    the evaluator failed to recognise a grounded, terminal reply — even if
+    the content that follows the caveat happens to be correct."""
+    import pytest
+
+    if is_max_turns_digest(response):
+        prefix = f"[{context}] " if context else ""
+        pytest.fail(
+            f"{prefix}Response begins with the max-turns digest caveat — "
+            f"the agentic loop exhausted ``agentic_max_turns`` without the "
+            f"evaluator returning terminal on a grounded reply. For simple "
+            f"queries this is an evaluator quality failure, not a success. "
+            f"Response: {(response or '')[:400]}"
+        )
+
+
+# =============================================================================
+# Warm-memory seeding
+# =============================================================================
+#
+# The default eval fixtures (`eval_db`, `eval_dialogue_memory`) start empty,
+# which does NOT reproduce the real-world state where the user's memory
+# already carries weeks of diary summaries. Field failures consistently
+# correlate with loaded context: gemma produces clean tool calls on empty
+# memory and slides into scaffolding leaks when a multi-hundred-char memory
+# digest is prepended to the system message.
+#
+# This helper seeds the diary table with dated summaries on a given topic
+# so the memory-search path hits real entries and produces a digest that
+# matches the production shape.
+
+def seed_diary_summaries(
+    db,
+    topic_summaries: List[Tuple[str, str]],
+) -> None:
+    """Seed ``conversation_summaries`` with the given (date_utc, summary) pairs.
+
+    ``date_utc`` must be ``YYYY-MM-DD``. The helper is a thin wrapper around
+    ``db.upsert_conversation_summary`` intended for evals that need a warm
+    memory state — e.g. "user has asked about the weather ten times in the
+    last fortnight" — to reproduce the loaded-context failure mode that the
+    reply engine hits in production.
+    """
+    for date_utc, summary in topic_summaries:
+        db.upsert_conversation_summary(
+            date_utc=date_utc,
+            summary=summary,
+            topics=None,
+            source_app="jarvis",
+        )
+
+
+@dataclass
+class ToolCallCapture:
+    """Captures tool calls during evaluation."""
+
+    calls: List[Dict[str, Any]] = field(default_factory=list)
+
+    def record(self, name: str, args: Dict[str, Any]):
+        self.calls.append({"name": name, "args": args})
+
+    def has_tool(self, name: str) -> bool:
+        return any(c["name"] == name for c in self.calls)
+
+    def has_any_tool(self) -> bool:
+        return len(self.calls) > 0
+
+    def get_args(self, name: str) -> Optional[Dict[str, Any]]:
+        for c in self.calls:
+            if c["name"] == name:
+                return c["args"]
+        return None
+
+    def tool_names(self) -> List[str]:
+        return [c["name"] for c in self.calls]
+
+    # Alias for backward compatibility
+    tool_sequence = tool_names
+
+    def clear(self):
+        self.calls = []
+
+
+# =============================================================================
+# Mock Tool Run Factory
+# =============================================================================
+
+def create_mock_tool_run(
+    capture: ToolCallCapture,
+    responses: Optional[Dict[str, str]] = None,
+):
+    """Create a mock tool runner that captures calls and returns canned responses.
+
+    Args:
+        capture: ToolCallCapture instance to record calls
+        responses: Dict mapping tool name → response text. Unmatched tools return "OK".
+
+    Returns:
+        A function suitable for patching ``run_tool_with_retries``.
+    """
+    responses = responses or {}
+
+    def mock_tool_run(db, cfg, tool_name, tool_args, **kwargs):
+        from jarvis.tools.types import ToolExecutionResult
+        capture.record(tool_name, tool_args or {})
+        reply = responses.get(tool_name, "OK")
+        return ToolExecutionResult(success=True, reply_text=reply)
+
+    return mock_tool_run
+
+
+@dataclass
+class MockConfig:
+    """Minimal config object for eval tests."""
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_chat_model: str = "gemma4:e2b"
+    ollama_embed_model: str = "nomic-embed-text"
+    db_path: str = ":memory:"
+    sqlite_vss_path: Optional[str] = None
+    voice_debug: bool = True
+    tts_enabled: bool = False
+    tts_engine: str = "piper"  # "piper" (default) or "chatterbox"
+    tts_voice: Optional[str] = None
+    tts_rate: int = 200
+    # Piper TTS settings
+    tts_piper_model_path: Optional[str] = None
+    tts_piper_speaker: Optional[int] = None
+    tts_piper_length_scale: float = 1.0
+    tts_piper_noise_scale: float = 0.667
+    tts_piper_noise_w: float = 0.8
+    tts_piper_sentence_silence: float = 0.2
+    # Chatterbox TTS settings
+    tts_chatterbox_device: str = "cpu"
+    tts_chatterbox_audio_prompt: Optional[str] = None
+    tts_chatterbox_exaggeration: float = 0.5
+    tts_chatterbox_cfg_weight: float = 0.5
+    web_search_enabled: bool = True
+    brave_search_api_key: str = ""
+    wikipedia_fallback_enabled: bool = True
+    llm_profile_select_timeout_sec: float = 10.0
+    llm_tools_timeout_sec: float = 8.0
+    llm_embed_timeout_sec: float = 10.0
+    llm_chat_timeout_sec: float = 120.0
+    agentic_max_turns: int = 8
+    memory_enrichment_max_results: int = 5
+    active_profiles: List[str] = field(default_factory=lambda: ["developer", "business", "life"])
+    location_enabled: bool = True
+    location_ip_address: Optional[str] = None
+    location_auto_detect: bool = False
+    location_cgnat_resolve_public_ip: bool = False
+    dialogue_memory_timeout: int = 300
+    mcps: Dict[str, Any] = field(default_factory=dict)
+    use_stdin: bool = True
+
+
+@dataclass
+class EvalResult:
+    """Result of a single eval test case."""
+    query: str
+    response: Optional[str]
+    is_passed: bool
+    failure_reason: Optional[str] = None
+    tool_calls_made: List[str] = field(default_factory=list)
+    turn_count: int = 0
+
+    def __str__(self) -> str:
+        status = "✅ PASS" if self.is_passed else "❌ FAIL"
+        lines = [
+            f"{status}: {self.query[:50]}...",
+            f"  Response: {(self.response or '')[:100]}...",
+            f"  Tools used: {', '.join(self.tool_calls_made) or 'none'}",
+            f"  Turns: {self.turn_count}",
+        ]
+        if self.failure_reason:
+            lines.append(f"  Reason: {self.failure_reason}")
+        return "\n".join(lines)
+
+
+@dataclass
+class EvalCase:
+    """A single eval test case definition."""
+    name: str
+    query: str
+    expected_tool_calls: List[str] = field(default_factory=list)
+    response_should_contain: List[str] = field(default_factory=list)
+    response_should_not_contain: List[str] = field(default_factory=list)
+    custom_validator: Optional[Callable[[str], bool]] = None
+    profile_hint: Optional[str] = None
+
+
+def assert_response_quality(result: EvalResult, case: EvalCase) -> None:
+    """Assert that the response meets quality criteria."""
+    response = result.response or ""
+    response_lower = response.lower()
+
+    # Check expected content
+    for expected in case.response_should_contain:
+        assert expected.lower() in response_lower, (
+            f"Response should contain '{expected}' but got: {response[:200]}..."
+        )
+
+    # Check excluded content
+    for excluded in case.response_should_not_contain:
+        assert excluded.lower() not in response_lower, (
+            f"Response should NOT contain '{excluded}' but got: {response[:200]}..."
+        )
+
+    # Check custom validator
+    if case.custom_validator:
+        assert case.custom_validator(response), (
+            f"Custom validation failed for response: {response[:200]}..."
+        )
+
+
+def is_generic_greeting(response: str) -> bool:
+    """Check if response is a generic greeting that ignores the query."""
+    generic_patterns = [
+        "how can i help you",
+        "what can i do for you",
+        "what would you like",
+        "how may i assist",
+        "is there something",
+        "let me know what",
+        "feel free to ask",
+    ]
+    response_lower = response.lower()
+    return any(pattern in response_lower for pattern in generic_patterns)
+
+
+def response_addresses_topic(response: str, topic_keywords: List[str]) -> bool:
+    """Check if response addresses the topic by mentioning relevant keywords."""
+    response_lower = response.lower()
+    return any(kw.lower() in response_lower for kw in topic_keywords)
+
+
+def create_mock_llm_response(content: str, tool_calls: Optional[List[Dict]] = None) -> Dict[str, Any]:
+    """Create a mock LLM response in Ollama format."""
+    message = {"content": content, "role": "assistant"}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {"message": message}
+
+
+def create_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a tool call in OpenAI format."""
+    return {
+        "id": f"call_{name}_001",
+        "function": {
+            "name": name,
+            "arguments": args
+        }
+    }
+
+
+# =============================================================================
+# LLM-as-Judge Evaluation
+# =============================================================================
+
+@dataclass
+class JudgeVerdict:
+    """Result from LLM judge evaluation."""
+    is_passed: bool
+    score: float  # 0.0 to 1.0
+    reasoning: str
+    criteria_scores: Dict[str, float] = field(default_factory=dict)
+
+
+def is_judge_llm_available() -> bool:
+    """Check if the judge LLM is available and the model exists."""
+    import requests
+    try:
+        # First check if Ollama is running
+        resp = requests.get(f"{JUDGE_BASE_URL.rstrip('/')}/api/tags", timeout=2)
+        if resp.status_code != 200:
+            return False
+
+        # Check if the judge model is available
+        data = resp.json()
+        models = data.get("models", [])
+        model_names = [m.get("name", "").split(":")[0] for m in models]
+
+        # Check if our judge model (or a variant) is available
+        judge_base = JUDGE_MODEL.split(":")[0]
+        return any(judge_base in name for name in model_names)
+    except Exception:
+        return False
+
+
+def call_judge_llm(system_prompt: str, user_prompt: str, timeout_sec: float = 120.0) -> Optional[str]:
+    """Call the judge LLM with a prompt."""
+    import requests
+
+    payload = {
+        "model": JUDGE_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "stream": False,
+        "options": {"num_ctx": 4096},
+    }
+
+    try:
+        resp = requests.post(
+            f"{JUDGE_BASE_URL.rstrip('/')}/api/chat",
+            json=payload,
+            timeout=timeout_sec
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and "message" in data:
+            return data["message"].get("content", "")
+    except Exception as e:
+        print(f"⚠️ Judge LLM call failed: {e}")
+        return None
+    return None
+
+
+def judge_response_answers_query(query: str, response: str, context: Optional[str] = None) -> JudgeVerdict:
+    """
+    Use LLM to judge if the response actually answers the user's query.
+
+    Args:
+        query: The user's original question
+        response: The assistant's response
+        context: Optional context about what data was available (e.g., tool results)
+
+    Returns:
+        JudgeVerdict with pass/fail, score, and reasoning
+    """
+    system_prompt = """You are an evaluation judge for a voice assistant. Your job is to determine if the assistant's response actually answers the user's question with real information.
+
+Score the response on these criteria (0-10 each):
+1. RELEVANCE: Does the response address the specific question asked? Score 0 if it doesn't mention the topic at all.
+2. COMPLETENESS: Does it provide the information the user was seeking? Score 0 for empty acknowledgments like "Sure!", "OK!", "Got it!" that provide no actual information.
+3. ACCURACY: Is the information factually plausible (based on any context provided)? Score 0 if no factual information is provided.
+4. NO_DEFLECTION: Does it avoid generic greetings, deflections like "How can I help you?", or empty acknowledgments? Score 0 for responses under 20 characters that don't answer the question.
+
+IMPORTANT: A response that just acknowledges without providing any actual information (e.g., "Sure thing!", "OK!", "Got it!") should score 0 on COMPLETENESS and fail overall.
+
+Output your evaluation in this EXACT format:
+RELEVANCE: [0-10]
+COMPLETENESS: [0-10]
+ACCURACY: [0-10]
+NO_DEFLECTION: [0-10]
+OVERALL: [PASS/FAIL]
+REASONING: [One paragraph explaining your verdict]"""
+
+    user_prompt = f"""User Query: {query}
+
+Assistant Response: {response}"""
+
+    if context:
+        user_prompt += f"\n\nContext (data available to assistant):\n{context[:2000]}"
+
+    judge_response = call_judge_llm(system_prompt, user_prompt)
+
+    if not judge_response:
+        # Fallback to heuristic evaluation if judge fails
+        return JudgeVerdict(
+            is_passed=not is_generic_greeting(response) and len(response) > 50,
+            score=0.5,
+            reasoning="Judge LLM unavailable, using heuristic fallback"
+        )
+
+    # Parse the judge response
+    return _parse_judge_response(judge_response)
+
+
+def judge_search_query_quality(
+    user_query: str,
+    search_query: str,
+    location: Optional[str] = None,
+    time_context: Optional[str] = None
+) -> JudgeVerdict:
+    """
+    Use LLM to judge if the search query is well-formed for the user's intent.
+
+    Args:
+        user_query: What the user asked
+        search_query: The search query the assistant generated
+        location: User's known location (should be included if relevant)
+        time_context: Time-related context (e.g., "this week", "tomorrow")
+
+    Returns:
+        JudgeVerdict evaluating search query quality
+    """
+    system_prompt = """You are evaluating search queries generated by a voice assistant.
+
+Score the search query on these criteria (0-10 each):
+1. INTENT_MATCH: Does the search query capture the user's actual intent?
+2. LOCATION_AWARENESS: If location is known and relevant, is it included appropriately?
+3. TIME_AWARENESS: If the query has time context, is it reflected in the search?
+4. SPECIFICITY: Is the query specific enough to get useful results?
+
+Output your evaluation in this EXACT format:
+INTENT_MATCH: [0-10]
+LOCATION_AWARENESS: [0-10]
+TIME_AWARENESS: [0-10]
+SPECIFICITY: [0-10]
+OVERALL: [PASS/FAIL]
+REASONING: [One paragraph explaining your verdict]"""
+
+    user_prompt = f"""User Query: "{user_query}"
+Generated Search Query: "{search_query}"
+"""
+    if location:
+        user_prompt += f"User's Known Location: {location}\n"
+    if time_context:
+        user_prompt += f"Time Context: {time_context}\n"
+
+    judge_response = call_judge_llm(system_prompt, user_prompt)
+
+    if not judge_response:
+        # Heuristic fallback
+        has_location = location and any(
+            loc_part.lower() in search_query.lower()
+            for loc_part in location.split(",")[0].split()
+        )
+        return JudgeVerdict(
+            is_passed=has_location if location else True,
+            score=0.5,
+            reasoning="Judge LLM unavailable, using heuristic fallback"
+        )
+
+    return _parse_judge_response(judge_response)
+
+
+def _parse_judge_response(response: str) -> JudgeVerdict:
+    """Parse the structured judge response into a JudgeVerdict."""
+    lines = response.strip().split("\n")
+    criteria_scores = {}
+    is_passed = False
+    reasoning = ""
+
+    for line in lines:
+        line = line.strip()
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip().upper()
+            value = value.strip()
+
+            if key == "OVERALL":
+                is_passed = "PASS" in value.upper()
+            elif key == "REASONING":
+                reasoning = value
+            else:
+                # Try to parse as score
+                try:
+                    score = float(value.split()[0])
+                    criteria_scores[key.lower()] = score / 10.0  # Normalize to 0-1
+                except (ValueError, IndexError):
+                    pass
+
+    # Calculate average score
+    avg_score = sum(criteria_scores.values()) / len(criteria_scores) if criteria_scores else 0.5
+
+    return JudgeVerdict(
+        is_passed=is_passed,
+        score=avg_score,
+        reasoning=reasoning,
+        criteria_scores=criteria_scores
+    )
+
+
+def judge_tool_usage_appropriateness(
+    query: str,
+    tools_called: List[str],
+    tool_args: List[Dict[str, Any]],
+    expected_tools: Optional[List[str]] = None
+) -> JudgeVerdict:
+    """
+    Judge whether the tools used were appropriate for the query.
+
+    Args:
+        query: User's question
+        tools_called: List of tool names that were called
+        tool_args: List of arguments passed to each tool
+        expected_tools: Optional list of tools that should have been called
+
+    Returns:
+        JudgeVerdict on tool usage
+    """
+    system_prompt = """You are evaluating tool usage by a voice assistant.
+
+Score on these criteria (0-10 each):
+1. TOOL_SELECTION: Were the right tools chosen for the task?
+2. ARG_QUALITY: Were the tool arguments well-formed and appropriate?
+3. EFFICIENCY: Was there unnecessary tool calling or missing necessary calls?
+
+Output your evaluation in this EXACT format:
+TOOL_SELECTION: [0-10]
+ARG_QUALITY: [0-10]
+EFFICIENCY: [0-10]
+OVERALL: [PASS/FAIL]
+REASONING: [One paragraph explaining your verdict]"""
+
+    tool_info = "\n".join([
+        f"- {name}: {args}" for name, args in zip(tools_called, tool_args)
+    ]) if tools_called else "No tools called"
+
+    user_prompt = f"""User Query: "{query}"
+
+Tools Called:
+{tool_info}
+"""
+    if expected_tools:
+        user_prompt += f"\nExpected Tools: {', '.join(expected_tools)}"
+
+    judge_response = call_judge_llm(system_prompt, user_prompt)
+
+    if not judge_response:
+        # Heuristic fallback
+        has_expected = not expected_tools or all(t in tools_called for t in expected_tools)
+        return JudgeVerdict(
+            is_passed=has_expected,
+            score=0.5,
+            reasoning="Judge LLM unavailable, using heuristic fallback"
+        )
+
+    return _parse_judge_response(judge_response)
+

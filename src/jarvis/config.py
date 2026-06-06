@@ -1,0 +1,868 @@
+import os
+import sys
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional
+from dotenv import load_dotenv
+
+
+# ============================================================================
+# SUPPORTED CHAT MODELS - Single Source of Truth
+# ============================================================================
+# This is the authoritative list of officially supported chat models.
+# Other modules should import from here rather than defining their own lists.
+
+SUPPORTED_CHAT_MODELS: Dict[str, Dict[str, str]] = {
+    "gemma4:e2b": {
+        "name": "Gemma 4 E2B (Default)",
+        "description": "Fast, multimodal, effective 2B — a little dumb, occasionally fumbles tool calls; ~7.2GB download",
+        "size": "~7.2GB",
+        "vram": "8GB+",
+    },
+    "gemma4:e4b": {
+        "name": "Gemma 4 E4B (Recommended)",
+        "description": "Smarter tool use and reasoning, multimodal, effective 4B — ~9.6GB download",
+        "size": "~9.6GB",
+        "vram": "16GB+",
+    },
+    "gpt-oss:20b": {
+        "name": "GPT-OSS 20B (High-end)",
+        "description": "Best performance, ~12GB download",
+        "size": "~12GB",
+        "vram": "24GB+",
+    },
+}
+
+# The default chat model (first in the supported list)
+DEFAULT_CHAT_MODEL = "gemma4:e2b"
+
+
+def get_supported_model_ids() -> set[str]:
+    """Get set of supported model IDs for quick lookup."""
+    return set(SUPPORTED_CHAT_MODELS.keys())
+
+
+def _default_dictation_hotkey() -> str:
+    """Return the platform-appropriate default dictation hotkey.
+
+    Aligned with WisprFlow defaults:
+    - Windows: Ctrl+Win (pynput maps Win to ``cmd``)
+    - macOS: Fn is not detectable by pynput, so use Ctrl+Option (WisprFlow
+      fallback when Fn is unavailable)
+    - Linux: Ctrl+Alt (mirrors macOS fallback)
+    """
+    if sys.platform == "win32":
+        return "ctrl+cmd"
+    elif sys.platform == "darwin":
+        return "ctrl+alt"
+    else:
+        return "ctrl+alt"
+
+
+def _default_db_path() -> str:
+    base = Path.home() / ".local" / "share" / "jarvis"
+    base.mkdir(parents=True, exist_ok=True)
+    return str(base / "jarvis.db")
+
+
+@dataclass(frozen=True)
+class Settings:
+    # Database & Storage
+    db_path: str
+    sqlite_vss_path: str | None
+
+    # LLM & AI Models
+    ollama_base_url: str
+    ollama_embed_model: str
+    ollama_chat_model: str
+    llm_chat_timeout_sec: float
+    llm_tools_timeout_sec: float
+    # Tight deadline for the cheap distil passes used by memory_digest and
+    # tool_result_digest. Separate from `llm_tools_timeout_sec` because
+    # those paths run a small classification-shaped LLM call, not a
+    # long-running tool — a 5-minute ceiling there would stall replies.
+    llm_digest_timeout_sec: float
+    llm_embedding_timeout_sec: float
+    llm_profile_select_timeout_sec: float
+
+    # Profiles & Behavior
+    active_profiles: list[str]
+    use_stdin: bool
+    voice_debug: bool
+
+    # Screen Capture
+    allowlist_bundles: list[str]
+
+    # Text-to-Speech
+    tts_enabled: bool
+    tts_engine: str  # "piper" (default) or "chatterbox"
+    tts_voice: str | None
+    tts_rate: int | None  # Words per minute (WPM), 200=normal
+    tts_chatterbox_device: str  # "cuda", "auto", or "cpu" for Chatterbox
+    tts_chatterbox_audio_prompt: str | None  # Path to audio file for voice cloning with Chatterbox
+    tts_chatterbox_exaggeration: float  # Emotion exaggeration control (0.0-1.0+)
+    tts_chatterbox_cfg_weight: float  # CFG weight for quality/speed trade-off
+
+    # Piper TTS
+    tts_piper_model_path: str | None  # Path to .onnx voice model
+    tts_piper_speaker: int | None  # Speaker ID for multi-speaker models
+    tts_piper_length_scale: float  # Speed: <1.0 faster, >1.0 slower
+    tts_piper_noise_scale: float  # Audio variation
+    tts_piper_noise_w: float  # Phoneme width variation
+    tts_piper_sentence_silence: float  # Post-sentence silence in seconds
+
+    # Voice Input & Audio
+    voice_device: str | None
+    sample_rate: int
+    voice_min_energy: float
+
+    # Voice Collection & Timing
+    voice_block_seconds: float
+    voice_collect_seconds: float
+    voice_max_collect_seconds: float
+
+    # Wake Word Detection
+    wake_word: str
+    wake_aliases: list[str]
+    wake_fuzzy_ratio: float
+
+    # Whisper Speech Recognition
+    whisper_model: str
+    whisper_backend: str  # "auto", "mlx", or "faster-whisper"
+    whisper_device: str  # "cuda", "auto", or "cpu" (only for faster-whisper)
+    whisper_compute_type: str
+    whisper_vad: bool
+    whisper_min_confidence: float
+    whisper_no_speech_threshold: float
+    whisper_min_audio_duration: float
+    whisper_min_word_length: int
+
+    # Voice Activity Detection (VAD)
+    vad_enabled: bool
+    vad_aggressiveness: int
+    vad_frame_ms: int
+    vad_pre_roll_ms: int
+    endpoint_silence_ms: int
+    max_utterance_ms: int
+    tts_max_utterance_ms: int
+
+    # UI/UX Features
+    tune_enabled: bool
+    hot_window_enabled: bool
+    hot_window_seconds: float
+
+    # Echo Detection
+    echo_energy_threshold: float
+    echo_tolerance: float
+
+    # Intent Judge (LLM-based intent classification)
+    # Always used when available, falls back to simple wake word detection
+    intent_judge_model: str
+    intent_judge_timeout_sec: float
+
+    # Transcript Buffer - ambient speech context for intent judge
+    transcript_buffer_duration_sec: float
+
+    # Memory & Dialogue
+    # Drives both the short-term memory window and forced diary update interval
+    dialogue_memory_timeout: float
+    memory_enrichment_max_results: int
+    memory_enrichment_source: str  # "all", "diary", or "graph"
+    # Tool-call + tool-result messages from prior replies in the hot window
+    # are re-injected into the next turn so follow-ups can reuse them instead
+    # of re-fetching. These knobs cap how many prior tool turns survive and
+    # how much of each tool payload is retained (the fence markers of
+    # UNTRUSTED WEB EXTRACT blocks are preserved on truncation).
+    tool_carryover_max_turns: int
+    tool_carryover_per_entry_chars: int
+    # Distil diary + graph into a short relevance-filtered note via a cheap
+    # LLM pass before injecting into the reply system prompt. When None
+    # (the default), it auto-enables for SMALL models (≤7B) and stays off
+    # for larger models that can handle raw dumps. Set explicitly to force.
+    memory_digest_enabled: Optional[bool]
+    # Distil raw tool-result payloads (e.g. webSearch extracts) into a
+    # short, attributed fact note via a cheap LLM pass before appending
+    # them as tool-role messages. When None (the default), it auto-enables
+    # for SMALL models (≤7B) and stays off for larger models that ground
+    # on the raw payload reliably. Set explicitly to force on/off.
+    tool_result_digest_enabled: Optional[bool]
+
+    # Agentic Loop
+    agentic_max_turns: int
+    tool_selection_strategy: str  # "all", "keyword", "embedding", or "llm"
+    # When `tool_selection_strategy == "llm"`, this model does the routing.
+    # Empty string means "reuse `ollama_chat_model`" (the default).
+    tool_router_model: str
+    # Optional override for the post-turn evaluator LLM. Empty string means
+    # "fall back to intent_judge_model, then ollama_chat_model" (the default).
+    evaluator_model: str
+    # None = auto (on for SMALL models, off for LARGE). Explicit true/false forces.
+    evaluator_enabled: Optional[bool]
+    # Upper bound on toolSearchTool invocations per reply turn. The cap
+    # prevents a small model from churning through the escape hatch forever
+    # when no tool really fits.
+    tool_search_max_calls: int
+    # Upper bound on evaluator-driven nudges per reply. Each time the
+    # evaluator says "continue" with a nudge, the nudge is injected into
+    # the next turn's system message. This cap stops nudge ping-pong when
+    # the model keeps producing prose despite the nudge.
+    evaluator_nudge_max: int
+    # Optional override for the pre-loop task-list planner model. Empty
+    # string means "fall back to tool_router_model → intent_judge_model →
+    # ollama_chat_model" (the default). The planner is a small
+    # classification-shaped pass so it rides the same small-model chain
+    # as the router and the evaluator.
+    planner_model: str
+    # Whether the pre-loop planner is enabled. True = planner always runs;
+    # False = planner never runs (legacy behaviour, with the
+    # compound_query fallback still active). Default True — the planner
+    # fails open to an empty plan so the cost of a miss is one cheap LLM
+    # round-trip, and the upside is multi-step queries actually complete.
+    planner_enabled: bool
+    # Timeout for the planner LLM call. Short because the planner is on
+    # the critical path — a long timeout would dominate first-token
+    # latency for every query. Planner fails open on timeout.
+    planner_timeout_sec: float
+
+    # Location Services
+    location_enabled: bool
+    location_cache_minutes: int
+    location_ip_address: str | None
+    location_auto_detect: bool
+    location_cgnat_resolve_public_ip: bool
+
+    # Web Search
+    web_search_enabled: bool
+    # Optional Brave Search API key. When set, Brave is used as the primary
+    # fallback when DuckDuckGo is rate-limited or returns no usable content.
+    # Empty string means "not configured" — the tool then falls through to
+    # the always-on Wikipedia fallback. Free tier is 2,000 queries/month.
+    brave_search_api_key: str
+    # Zero-config Wikipedia fallback toggle. When True (default), the tool
+    # queries Wikipedia's REST summary API as a last resort before giving up
+    # with the honest "blocked" envelope. Privacy-light (public API, no key,
+    # no account) and language-aware via the Whisper-detected utterance
+    # language.
+    wikipedia_fallback_enabled: bool
+
+    # Dictation (hold-to-dictate)
+    dictation_enabled: bool
+    dictation_hotkey: str
+    dictation_filler_removal: bool
+    dictation_custom_dictionary: list
+
+    # MCP Integration
+    mcps: Dict[str, Any]
+
+
+
+def default_config_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / "jarvis" / "config.json"
+    return Path.home() / ".config" / "jarvis" / "config.json"
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_json(path: Path, data: Dict[str, Any]) -> bool:
+    """Save config data to JSON file. Returns True on success."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _migrate_config(cfg_path: Path, cfg_json: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Apply config migrations for version upgrades.
+
+    Returns the (possibly modified) config dict.
+    """
+    modified = False
+
+    # Get current migration version (0 if not set = pre-migration config)
+    migration_version = cfg_json.get("_config_version", 0)
+
+    # Migration v1: tts_engine "system" -> "piper"
+    # Piper is now the default TTS with auto-download support.
+    if migration_version < 1:
+        if cfg_json.get("tts_engine") == "system":
+            cfg_json["tts_engine"] = "piper"
+            print("📢 Upgraded TTS engine: system → piper (neural voice with auto-download)", flush=True)
+            print("   To revert: set \"tts_engine\": \"system\" in config.json", flush=True)
+        cfg_json["_config_version"] = 1
+        modified = True
+
+    # Save migrated config
+    if modified:
+        if _save_json(cfg_path, cfg_json):
+            pass  # Silent success
+        else:
+            print("   ⚠️ Could not save config migration (using new settings in memory).", flush=True)
+
+    return cfg_json
+
+
+def load_config() -> Dict[str, Any]:
+    """
+    Load and return the merged configuration dictionary.
+
+    Returns defaults merged with any values from the config file.
+    Unlike load_settings(), this returns the raw dict instead of a Settings object.
+    """
+    cfg_path_env = os.environ.get("JARVIS_CONFIG_PATH")
+    cfg_path = Path(cfg_path_env).expanduser() if cfg_path_env else default_config_path()
+    cfg_json = _load_json(cfg_path)
+
+    # Apply config migrations for version upgrades
+    if cfg_json:
+        cfg_json = _migrate_config(cfg_path, cfg_json)
+
+    defaults = get_default_config()
+    return {**defaults, **cfg_json}
+
+
+def _ensure_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return [str(value)]
+
+
+def _ensure_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    # Accept list of pairs like [{"name":..., ...}] and convert to dict by name if present
+    try:
+        if isinstance(value, list):
+            out: Dict[str, Any] = {}
+            for item in value:
+                if isinstance(item, dict):
+                    key = str(item.get("name")) if item.get("name") is not None else None
+                    if key:
+                        out[key] = {k: v for k, v in item.items() if k != "name"}
+            if out:
+                return out
+    except Exception:
+        pass
+    return {}
+
+
+def get_default_config() -> Dict[str, Any]:
+    """Returns the default configuration values."""
+    return {
+        # Database & Storage
+        "db_path": _default_db_path(),
+        "sqlite_vss_path": None,
+
+        # LLM & AI Models
+        "ollama_base_url": "http://127.0.0.1:11434",
+        "ollama_embed_model": "nomic-embed-text",
+        "ollama_chat_model": DEFAULT_CHAT_MODEL,
+        "llm_chat_timeout_sec": 180.0,
+        "llm_tools_timeout_sec": 300.0,
+        # Cheap distil passes should fail fast — a hung digest call would
+        # block the reply loop per tool call, amplified by agentic turns.
+        "llm_digest_timeout_sec": 8.0,
+        "llm_embedding_timeout_sec": 60.0,
+        "llm_profile_select_timeout_sec": 30.0,
+
+        # Profiles & Behavior
+        "active_profiles": ["developer", "business", "life"],
+        "use_stdin": False,
+
+        # Screen Capture
+        "allowlist_bundles": [
+            "com.apple.Terminal",
+            "com.googlecode.iterm2",
+            "com.microsoft.VSCode",
+            "com.jetbrains.intellij",
+        ],
+
+
+        # Text-to-Speech
+        "tts_enabled": True,
+        "tts_engine": "piper",  # "piper" (default) or "chatterbox"
+        "tts_voice": None,
+        "tts_rate": 200,  # Words per minute (WPM), 200=normal
+        "tts_chatterbox_device": "cuda",  # "cuda" (recommended), "auto", or "cpu"
+        "tts_chatterbox_audio_prompt": None,  # Path to audio file for voice cloning
+        "tts_chatterbox_exaggeration": 0.5,  # Emotion exaggeration (0.0-1.0+)
+        "tts_chatterbox_cfg_weight": 0.5,  # CFG weight for quality/speed trade-off
+
+        # Piper TTS
+        "tts_piper_model_path": None,  # Path to .onnx voice model
+        "tts_piper_speaker": None,  # Speaker ID for multi-speaker models
+        "tts_piper_length_scale": 0.65,  # Speed: <1.0 faster, >1.0 slower (0.65 = ~30% faster)
+        "tts_piper_noise_scale": 0.8,  # Audio variation (higher = more expressive)
+        "tts_piper_noise_w": 1.0,  # Phoneme width variation (higher = more lively)
+        "tts_piper_sentence_silence": 0.2,  # Post-sentence silence in seconds
+
+        # Voice Input & Audio
+        "voice_device": None,
+        "sample_rate": 16000,
+        "voice_min_energy": 0.02,
+
+        # Voice Collection & Timing
+        "voice_block_seconds": 4.0,
+        "voice_collect_seconds": 4.5,
+        "voice_max_collect_seconds": 180.0,
+
+        # Wake Word Detection
+        "wake_word": "jarvis",
+        "wake_aliases": ["joris", "charis", "chavis", "jar is", "jaivis", "jervis", "jarvus", "jarviz", "javis", "jairus", "jarryst", "chyrus"],
+        "wake_fuzzy_ratio": 0.78,
+
+        # Whisper Speech Recognition
+        "whisper_model": "medium",
+        "whisper_backend": "auto",  # "auto" (MLX on Apple Silicon, else faster-whisper), "mlx", or "faster-whisper"
+        "whisper_device": "auto",  # "cuda" (recommended if available), "auto", or "cpu" (only for faster-whisper)
+        "whisper_compute_type": "int8",
+        "whisper_vad": True,
+        "whisper_min_confidence": 0.3,  # Filter low-confidence segments (hallucinations)
+        "whisper_no_speech_threshold": 0.5,  # Hard cutoff: reject segments where no_speech_prob >= this
+        "whisper_min_audio_duration": 0.15,
+        "whisper_min_word_length": 1,
+
+        # Voice Activity Detection (VAD)
+        "vad_enabled": True,
+        "vad_aggressiveness": 2,
+        "vad_frame_ms": 20,
+        "vad_pre_roll_ms": 240,
+        "endpoint_silence_ms": 800,
+        "max_utterance_ms": 12000,
+        "tts_max_utterance_ms": 3000,  # Shorter timeout during TTS for quick stop detection
+
+        # UI/UX Features
+        "tune_enabled": True,
+        "hot_window_enabled": True,
+        "hot_window_seconds": 3.0,
+        "echo_energy_threshold": 2.0,
+        "echo_tolerance": 0.3,  # Time tolerance for echo detection timing
+
+        # Audio Wake Word Detection
+        # Intent Judge (LLM-based intent classification)
+        # Always used when available, falls back to simple wake word detection
+        "llm_thinking_enabled": False,  # Enable thinking/reasoning mode for chat (slower but may improve quality)
+        "intent_judge_model": "gemma4:e2b",  # Model for intent judging (needs reasoning ability)
+        "intent_judge_timeout_sec": 15.0,  # Max time to wait for intent judge response
+        "intent_judge_thinking_enabled": False,  # Enable thinking for intent judge (adds latency to wake detection)
+
+        # Transcript Buffer - used for both retention and context passed to intent judge
+        # 120s (2 min) provides enough ambient speech context for intent judging
+        # in group conversations. Separate from dialogue memory.
+        "transcript_buffer_duration_sec": 120.0,
+
+        # Memory & Dialogue
+        # dialogue_memory_timeout drives the short-term memory window AND the forced
+        # diary update interval. After a diary update, enrichment retrieves older context.
+        "dialogue_memory_timeout": 300.0,
+        "memory_enrichment_max_results": 3,
+        "memory_enrichment_source": "all",  # "all", "diary", or "graph"
+        # Tool carryover: cap re-injected prior tool turns + chars per entry.
+        "tool_carryover_max_turns": 2,
+        "tool_carryover_per_entry_chars": 1200,
+        # None = auto (on for small models ≤7B, off for large). Set true/false to force.
+        "memory_digest_enabled": None,
+        # Distil raw tool results (e.g. webSearch extracts) into a short
+        # attributed fact note for small models. Defaults to off: the extra
+        # None = auto (on for small models ≤7B, off for large). Set true/false to force.
+        # Auto-on for small models mitigates fetch_web_page's 50k-char payloads
+        # blowing the 8192 num_ctx window before the main model sees them.
+        "tool_result_digest_enabled": None,
+
+        # Agentic Loop
+        "agentic_max_turns": 8,
+        "tool_selection_strategy": "llm",
+        # Empty string = reuse intent_judge_model (small, fast, already warm
+        # for wake-word paths), falling back to ollama_chat_model only if the
+        # judge model isn't set. Override to decouple routing from both —
+        # useful when you want routing on a dedicated smaller model.
+        "tool_router_model": "",
+        # Empty string = reuse intent_judge_model, falling through to
+        # ollama_chat_model only if the judge isn't set. Override to pin the
+        # evaluator to a dedicated small/fast model.
+        "evaluator_model": "",
+        # None = auto (on for small models, off for large). Set true/false to force.
+        "evaluator_enabled": None,
+        # Cap the number of toolSearchTool invocations per reply.
+        "tool_search_max_calls": 3,
+        # Cap the number of evaluator-driven nudges per reply.
+        "evaluator_nudge_max": 2,
+        # Task-list planner (see src/jarvis/reply/planner.spec.md). Empty
+        # model string = reuse tool_router_model → intent_judge_model →
+        # ollama_chat_model.
+        "planner_model": "",
+        "planner_enabled": True,
+        "planner_timeout_sec": 6.0,
+
+        # Stop Commands
+        "stop_commands": ["stop", "quiet", "shush", "silence", "enough", "shut up"],
+        "stop_command_fuzzy_ratio": 0.8,
+
+        # Location Services
+        "location_enabled": True,
+        "location_cache_minutes": 60,
+        "location_ip_address": None,
+        "location_auto_detect": True,
+        # When behind CGNAT (100.64.0.0/10), attempt a privacy-light external DNS query to discover true public IP.
+        # Uses a single OpenDNS resolver lookup of myip.opendns.com over DNS (no HTTP services). Disable to avoid any external request.
+        "location_cgnat_resolve_public_ip": True,
+
+        # Web Search
+        "web_search_enabled": True,
+        "brave_search_api_key": "",
+        "wikipedia_fallback_enabled": True,
+
+        # Dictation (hold-to-dictate, WisprFlow-like)
+        "dictation_enabled": True,
+        "dictation_hotkey": _default_dictation_hotkey(),
+        "dictation_filler_removal": False,
+        "dictation_thinking_enabled": False,  # Enable thinking for dictation filler removal (adds latency)
+        "dictation_custom_dictionary": [],
+
+        # MCP Integration (external servers Jarvis can use). No defaults.
+        "mcps": {},
+    }
+
+
+def export_example_config(include_db_path: bool = False) -> Dict[str, Any]:
+    """Returns example config suitable for JSON export (with adjusted db_path)."""
+    config = get_default_config().copy()
+    if not include_db_path:
+        # Use a user-friendly path for examples
+        config["db_path"] = "~/.local/share/jarvis/jarvis.db"
+    return config
+
+
+def load_settings() -> Settings:
+    # Load environment for debug toggles and optional config file path only
+    load_dotenv(override=False)
+
+    # Resolve config path
+    cfg_path_env = os.environ.get("JARVIS_CONFIG_PATH")
+    cfg_path = Path(cfg_path_env).expanduser() if cfg_path_env else default_config_path()
+    cfg_dir = cfg_path.parent
+    try:
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Load JSON configuration (non-debug settings)
+    cfg_json = _load_json(cfg_path)
+
+    # Apply config migrations for version upgrades
+    if cfg_json:
+        cfg_json = _migrate_config(cfg_path, cfg_json)
+
+    # Get defaults and merge with JSON (JSON wins)
+    defaults = get_default_config()
+    merged: Dict[str, Any] = {**defaults, **cfg_json}
+
+    # Build Settings. Some fields support env var overrides.
+    # Env overrides: JARVIS_VOICE_DEBUG, JARVIS_WHISPER_BACKEND
+    voice_debug = os.environ.get("JARVIS_VOICE_DEBUG", "0") == "1"
+
+    # Normalize/convert fields
+    db_path = str(merged.get("db_path") or _default_db_path())
+    sqlite_vss_path = merged.get("sqlite_vss_path")
+    allowlist_bundles = _ensure_list(merged.get("allowlist_bundles"))
+
+    ollama_base_url = str(merged.get("ollama_base_url"))
+    ollama_embed_model = str(merged.get("ollama_embed_model"))
+    ollama_chat_model = str(merged.get("ollama_chat_model"))
+    use_stdin = bool(merged.get("use_stdin", False))
+    active_profiles = _ensure_list(merged.get("active_profiles"))
+    tts_enabled = bool(merged.get("tts_enabled", True))
+    tts_engine = str(merged.get("tts_engine", "piper")).lower()
+    if tts_engine not in ("piper", "chatterbox"):
+        tts_engine = "piper"  # Default to piper if invalid value
+    tts_voice_val = merged.get("tts_voice")
+    tts_voice = None if tts_voice_val in (None, "", "null") else str(tts_voice_val)
+    tts_rate_val = merged.get("tts_rate")
+    try:
+        tts_rate = None if tts_rate_val in (None, "", "null") else int(tts_rate_val)
+    except Exception:
+        tts_rate = None
+    tts_chatterbox_device = str(merged.get("tts_chatterbox_device", "cuda")).lower()
+    if tts_chatterbox_device not in ("cuda", "auto", "cpu"):
+        tts_chatterbox_device = "cuda"  # Default to cuda if invalid value
+    tts_chatterbox_audio_prompt_val = merged.get("tts_chatterbox_audio_prompt")
+    tts_chatterbox_audio_prompt = None if tts_chatterbox_audio_prompt_val in (None, "", "null") else str(tts_chatterbox_audio_prompt_val)
+    tts_chatterbox_exaggeration = float(merged.get("tts_chatterbox_exaggeration", 0.5))
+    tts_chatterbox_cfg_weight = float(merged.get("tts_chatterbox_cfg_weight", 0.5))
+
+    # Piper TTS settings
+    tts_piper_model_path_val = merged.get("tts_piper_model_path")
+    tts_piper_model_path = None if tts_piper_model_path_val in (None, "", "null") else str(tts_piper_model_path_val)
+    tts_piper_speaker_val = merged.get("tts_piper_speaker")
+    try:
+        tts_piper_speaker = None if tts_piper_speaker_val in (None, "", "null") else int(tts_piper_speaker_val)
+    except Exception:
+        tts_piper_speaker = None
+    tts_piper_length_scale = float(merged.get("tts_piper_length_scale", 0.65))
+    tts_piper_noise_scale = float(merged.get("tts_piper_noise_scale", 0.8))
+    tts_piper_noise_w = float(merged.get("tts_piper_noise_w", 1.0))
+    tts_piper_sentence_silence = float(merged.get("tts_piper_sentence_silence", 0.2))
+
+    voice_device_val = merged.get("voice_device")
+    voice_device = None if voice_device_val in (None, "", "default", "system") else str(voice_device_val)
+    voice_block_seconds = float(merged.get("voice_block_seconds", 4.0))
+    voice_collect_seconds = float(merged.get("voice_collect_seconds", 2.5))
+    voice_max_collect_seconds = float(merged.get("voice_max_collect_seconds", 60.0))
+    wake_word = str(merged.get("wake_word", "jarvis")).strip().lower()
+    wake_aliases = [a.strip().lower() for a in _ensure_list(merged.get("wake_aliases")) if a.strip()]
+    wake_fuzzy_ratio = float(merged.get("wake_fuzzy_ratio", 0.78))
+    whisper_model = str(merged.get("whisper_model", "medium"))
+    whisper_backend = os.environ.get("JARVIS_WHISPER_BACKEND", "").lower() or str(merged.get("whisper_backend", "auto")).lower()
+    if whisper_backend not in ("auto", "mlx", "faster-whisper"):
+        whisper_backend = "auto"
+    whisper_device = str(merged.get("whisper_device", "auto")).lower()
+    if whisper_device not in ("cuda", "auto", "cpu"):
+        whisper_device = "auto"
+    whisper_compute_type = str(merged.get("whisper_compute_type", "int8"))
+    whisper_vad = bool(merged.get("whisper_vad", True))
+    voice_min_energy = float(merged.get("voice_min_energy", 0.02))
+    vad_enabled = bool(merged.get("vad_enabled", True))
+    vad_aggressiveness = int(merged.get("vad_aggressiveness", 2))
+    vad_frame_ms = int(merged.get("vad_frame_ms", 20))
+    vad_pre_roll_ms = int(merged.get("vad_pre_roll_ms", 240))
+    endpoint_silence_ms = int(merged.get("endpoint_silence_ms", 800))
+    max_utterance_ms = int(merged.get("max_utterance_ms", 12000))
+    tts_max_utterance_ms = int(merged.get("tts_max_utterance_ms", 3000))
+    sample_rate = int(merged.get("sample_rate", 16000))
+    tune_enabled = bool(merged.get("tune_enabled", True))
+    hot_window_enabled = bool(merged.get("hot_window_enabled", True))
+    hot_window_seconds = float(merged.get("hot_window_seconds", 3.0))
+    echo_energy_threshold = float(merged.get("echo_energy_threshold", 2.0))
+    echo_tolerance = float(merged.get("echo_tolerance", 0.3))
+
+    # Intent Judge - always used when available
+    intent_judge_model = str(merged.get("intent_judge_model", "gemma4:e2b"))
+    intent_judge_timeout_sec = float(merged.get("intent_judge_timeout_sec", 10.0))
+
+    # Transcript Buffer - ambient speech context for intent judge (separate from dialogue)
+    transcript_buffer_duration_sec = float(merged.get("transcript_buffer_duration_sec", 120.0))
+
+    # Dialogue memory window and forced diary update share this duration
+    dialogue_memory_timeout = float(merged.get("dialogue_memory_timeout", 300.0))
+    memory_enrichment_max_results = int(merged.get("memory_enrichment_max_results", 3))
+    memory_enrichment_source = str(merged.get("memory_enrichment_source", "all")).lower()
+    if memory_enrichment_source not in ("all", "diary", "graph"):
+        memory_enrichment_source = "all"
+    tool_carryover_max_turns = max(0, int(merged.get("tool_carryover_max_turns", 2)))
+    tool_carryover_per_entry_chars = max(200, int(merged.get("tool_carryover_per_entry_chars", 1200)))
+    _digest_raw = merged.get("memory_digest_enabled", None)
+    memory_digest_enabled: Optional[bool]
+    if _digest_raw is None:
+        memory_digest_enabled = None
+    else:
+        memory_digest_enabled = bool(_digest_raw)
+    _tool_digest_raw = merged.get("tool_result_digest_enabled", None)
+    tool_result_digest_enabled: Optional[bool]
+    if _tool_digest_raw is None:
+        tool_result_digest_enabled = None
+    else:
+        tool_result_digest_enabled = bool(_tool_digest_raw)
+    agentic_max_turns = int(merged.get("agentic_max_turns", 8))
+    tool_selection_strategy = str(merged.get("tool_selection_strategy", "llm")).lower()
+    if tool_selection_strategy not in ("all", "keyword", "embedding", "llm"):
+        tool_selection_strategy = "llm"
+    tool_router_model = str(merged.get("tool_router_model", "") or "").strip()
+    evaluator_model = str(merged.get("evaluator_model", "") or "").strip()
+    _eval_raw = merged.get("evaluator_enabled", None)
+    evaluator_enabled: Optional[bool]
+    if _eval_raw is None:
+        evaluator_enabled = None
+    else:
+        evaluator_enabled = bool(_eval_raw)
+    planner_model = str(merged.get("planner_model", "") or "").strip()
+    planner_enabled = bool(merged.get("planner_enabled", True))
+    try:
+        planner_timeout_sec = float(merged.get("planner_timeout_sec", 6.0))
+    except (TypeError, ValueError):
+        planner_timeout_sec = 6.0
+    try:
+        tool_search_max_calls = int(merged.get("tool_search_max_calls", 3))
+    except (TypeError, ValueError):
+        tool_search_max_calls = 3
+    if tool_search_max_calls < 0:
+        tool_search_max_calls = 0
+    try:
+        evaluator_nudge_max = int(merged.get("evaluator_nudge_max", 2))
+    except (TypeError, ValueError):
+        evaluator_nudge_max = 2
+    if evaluator_nudge_max < 0:
+        evaluator_nudge_max = 0
+    location_enabled = bool(merged.get("location_enabled", True))
+    location_cache_minutes = int(merged.get("location_cache_minutes", 60))
+    location_ip_address_val = merged.get("location_ip_address")
+    location_ip_address = None if location_ip_address_val in (None, "", "null") else str(location_ip_address_val)
+    location_auto_detect = bool(merged.get("location_auto_detect", True))
+    location_cgnat_resolve_public_ip = bool(merged.get("location_cgnat_resolve_public_ip", True))
+    web_search_enabled = bool(merged.get("web_search_enabled", True))
+    brave_search_api_key = str(merged.get("brave_search_api_key", "") or "").strip()
+    wikipedia_fallback_enabled = bool(merged.get("wikipedia_fallback_enabled", True))
+    dictation_enabled = bool(merged.get("dictation_enabled", True))
+    dictation_hotkey = str(merged.get("dictation_hotkey", _default_dictation_hotkey())).strip()
+    dictation_filler_removal = bool(merged.get("dictation_filler_removal", False))
+    raw_dict = merged.get("dictation_custom_dictionary", [])
+    dictation_custom_dictionary = list(raw_dict) if isinstance(raw_dict, list) else []
+    mcps = _ensure_dict(merged.get("mcps"))
+    whisper_min_confidence = float(merged.get("whisper_min_confidence", 0.4))
+    whisper_no_speech_threshold = float(merged.get("whisper_no_speech_threshold", 0.5))
+    whisper_min_audio_duration = float(merged.get("whisper_min_audio_duration", 0.3))
+    whisper_min_word_length = int(merged.get("whisper_min_word_length", 2))
+    llm_chat_timeout_sec = float(merged.get("llm_chat_timeout_sec", 180.0))
+    llm_tools_timeout_sec = float(merged.get("llm_tools_timeout_sec", 300.0))
+    llm_digest_timeout_sec = float(merged.get("llm_digest_timeout_sec", 8.0))
+    llm_embedding_timeout_sec = float(merged.get("llm_embedding_timeout_sec", 60.0))
+    llm_profile_select_timeout_sec = float(merged.get("llm_profile_select_timeout_sec", 30.0))
+
+    return Settings(
+        # Database & Storage
+        db_path=db_path,
+        sqlite_vss_path=sqlite_vss_path,
+
+        # LLM & AI Models
+        ollama_base_url=ollama_base_url,
+        ollama_embed_model=ollama_embed_model,
+        ollama_chat_model=ollama_chat_model,
+        llm_chat_timeout_sec=llm_chat_timeout_sec,
+        llm_tools_timeout_sec=llm_tools_timeout_sec,
+        llm_digest_timeout_sec=llm_digest_timeout_sec,
+        llm_embedding_timeout_sec=llm_embedding_timeout_sec,
+        llm_profile_select_timeout_sec=llm_profile_select_timeout_sec,
+
+        # Profiles & Behavior
+        active_profiles=active_profiles,
+        use_stdin=use_stdin,
+        voice_debug=voice_debug,
+
+        # Screen Capture
+        allowlist_bundles=allowlist_bundles,
+
+        # Text-to-Speech
+        tts_enabled=tts_enabled,
+        tts_engine=tts_engine,
+        tts_voice=tts_voice,
+        tts_rate=tts_rate,
+        tts_chatterbox_device=tts_chatterbox_device,
+        tts_chatterbox_audio_prompt=tts_chatterbox_audio_prompt,
+        tts_chatterbox_exaggeration=tts_chatterbox_exaggeration,
+        tts_chatterbox_cfg_weight=tts_chatterbox_cfg_weight,
+
+        # Piper TTS
+        tts_piper_model_path=tts_piper_model_path,
+        tts_piper_speaker=tts_piper_speaker,
+        tts_piper_length_scale=tts_piper_length_scale,
+        tts_piper_noise_scale=tts_piper_noise_scale,
+        tts_piper_noise_w=tts_piper_noise_w,
+        tts_piper_sentence_silence=tts_piper_sentence_silence,
+
+        # Voice Input & Audio
+        voice_device=voice_device,
+        sample_rate=sample_rate,
+        voice_min_energy=voice_min_energy,
+
+        # Voice Collection & Timing
+        voice_block_seconds=voice_block_seconds,
+        voice_collect_seconds=voice_collect_seconds,
+        voice_max_collect_seconds=voice_max_collect_seconds,
+
+        # Wake Word Detection
+        wake_word=wake_word,
+        wake_aliases=wake_aliases,
+        wake_fuzzy_ratio=wake_fuzzy_ratio,
+
+        # Whisper Speech Recognition
+        whisper_model=whisper_model,
+        whisper_backend=whisper_backend,
+        whisper_device=whisper_device,
+        whisper_compute_type=whisper_compute_type,
+        whisper_vad=whisper_vad,
+        whisper_min_confidence=whisper_min_confidence,
+        whisper_no_speech_threshold=whisper_no_speech_threshold,
+        whisper_min_audio_duration=whisper_min_audio_duration,
+        whisper_min_word_length=whisper_min_word_length,
+
+        # Voice Activity Detection (VAD)
+        vad_enabled=vad_enabled,
+        vad_aggressiveness=vad_aggressiveness,
+        vad_frame_ms=vad_frame_ms,
+        vad_pre_roll_ms=vad_pre_roll_ms,
+        endpoint_silence_ms=endpoint_silence_ms,
+        max_utterance_ms=max_utterance_ms,
+        tts_max_utterance_ms=tts_max_utterance_ms,
+
+        # UI/UX Features
+        tune_enabled=tune_enabled,
+        hot_window_enabled=hot_window_enabled,
+        hot_window_seconds=hot_window_seconds,
+        echo_energy_threshold=echo_energy_threshold,
+        echo_tolerance=echo_tolerance,
+        # Intent Judge - always used when available
+        intent_judge_model=intent_judge_model,
+        intent_judge_timeout_sec=intent_judge_timeout_sec,
+
+        # Transcript Buffer
+        transcript_buffer_duration_sec=transcript_buffer_duration_sec,
+
+        # Memory & Dialogue
+        dialogue_memory_timeout=dialogue_memory_timeout,
+        memory_enrichment_max_results=memory_enrichment_max_results,
+        memory_enrichment_source=memory_enrichment_source,
+        tool_carryover_max_turns=tool_carryover_max_turns,
+        tool_carryover_per_entry_chars=tool_carryover_per_entry_chars,
+        memory_digest_enabled=memory_digest_enabled,
+        tool_result_digest_enabled=tool_result_digest_enabled,
+        agentic_max_turns=agentic_max_turns,
+        tool_selection_strategy=tool_selection_strategy,
+        tool_router_model=tool_router_model,
+        evaluator_model=evaluator_model,
+        evaluator_enabled=evaluator_enabled,
+        tool_search_max_calls=tool_search_max_calls,
+        evaluator_nudge_max=evaluator_nudge_max,
+        planner_model=planner_model,
+        planner_enabled=planner_enabled,
+        planner_timeout_sec=planner_timeout_sec,
+
+        # Location Services
+        location_enabled=location_enabled,
+        location_cache_minutes=location_cache_minutes,
+        location_ip_address=location_ip_address,
+        location_auto_detect=location_auto_detect,
+        location_cgnat_resolve_public_ip=location_cgnat_resolve_public_ip,
+
+        # Web Search
+        web_search_enabled=web_search_enabled,
+        brave_search_api_key=brave_search_api_key,
+        wikipedia_fallback_enabled=wikipedia_fallback_enabled,
+
+        # Dictation
+        dictation_enabled=dictation_enabled,
+        dictation_hotkey=dictation_hotkey,
+        dictation_filler_removal=dictation_filler_removal,
+        dictation_custom_dictionary=dictation_custom_dictionary,
+
+        # MCP Integration
+        mcps=mcps,
+    )

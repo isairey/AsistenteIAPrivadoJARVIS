@@ -1,0 +1,24 @@
+.DS_Store
+.env/
+.venv/
+__pycache__/
+.pytest_cache/
+tests/performance/reports/
+.mamba_env/
+.micromamba/
+.claude/*
+!.claude/launch.json
+!.claude/skills/
+
+# Release artifacts
+release_output.log
+node_modules/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.backup
+qt.conf
+
+# Auto-generated version file (created at build time)
+src/jarvis/_version.py

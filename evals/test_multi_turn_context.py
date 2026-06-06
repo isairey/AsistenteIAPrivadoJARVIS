@@ -1,0 +1,506 @@
+"""
+Multi-Turn Context Evaluations
+
+Tests the agent's ability to handle multi-turn conversations correctly:
+1. Topic Switching - Selecting correct tool when conversation topic changes
+2. Context Anchoring - Not getting "stuck" on previous turn's tool
+3. Follow-up Handling - Using context from previous turns when relevant
+
+These evals are critical for catching regressions where the model might:
+- Call the wrong tool after a topic change (e.g., getWeather for store hours)
+- Ignore context from previous turns
+- Fail to follow up on established conversation context
+
+Run: ./scripts/run_evals.sh
+"""
+
+import pytest
+from unittest.mock import patch
+
+from conftest import requires_judge_llm
+from helpers import (
+    MockConfig, ToolCallCapture,
+    create_mock_tool_run,
+    JUDGE_MODEL,
+)
+
+
+# =============================================================================
+# Test Data - Consistent tool responses for reproducibility
+# =============================================================================
+
+MOCK_WEATHER_RESPONSE = """Current weather in Kensington, Royal Kensington and Chelsea, United Kingdom:
+Conditions: Overcast
+Temperature: 7.8°C
+Feels like: 5°C
+Humidity: 75%
+Wind: 12 km/h from the west
+"""
+
+MOCK_STORE_HOURS_SEARCH = """Web search results for 'CEX store hours Kensington':
+
+**Content from top result:**
+CEX Kensington High Street
+Opening Hours:
+Monday - Saturday: 10:00 AM - 6:00 PM
+Sunday: 11:00 AM - 5:00 PM
+
+**Other search results:**
+1. **CEX Kensington - Store Info** - https://uk.webuy.com/store/kensington
+2. **CEX Store Locator** - https://uk.webuy.com/stores
+"""
+
+MOCK_NEWS_SEARCH = """Web search results for 'tech news today':
+
+**Content from top result:**
+Today's Tech Headlines:
+- Apple announces new M4 chip
+- OpenAI releases GPT-5
+- SpaceX Starship completes orbital test
+
+**Other search results:**
+1. **TechCrunch** - https://techcrunch.com
+2. **The Verge** - https://theverge.com
+"""
+
+
+# =============================================================================
+# Topic Switching Evaluations (Live LLM)
+# =============================================================================
+
+class TestTopicSwitching:
+    """
+    Tests that the agent selects the correct tool when the conversation
+    topic changes between turns.
+
+    Uses real LLM inference to test actual model behavior.
+    Tool execution is mocked for consistent responses.
+    """
+
+    @pytest.mark.eval
+    @requires_judge_llm
+    def test_weather_then_store_hours(self, mock_config, eval_db, eval_dialogue_memory):
+        """
+        After weather query, asking about store hours should use webSearch.
+
+        Scenario:
+        - Turn 1: "How's the weather?" -> getWeather (correct)
+        - Turn 2: "Can you check when CEX closes?" -> webSearch (NOT getWeather!)
+
+        This tests the exact bug scenario where llama3.2:3b called getWeather
+        for a store hours query because it got anchored on the previous tool.
+        """
+        from jarvis.reply.engine import run_reply_engine
+
+        mock_config.ollama_base_url = "http://localhost:11434"
+        mock_config.ollama_chat_model = JUDGE_MODEL
+
+        capture = ToolCallCapture()
+        mock_tool_run = create_mock_tool_run(capture, {
+            "getWeather": MOCK_WEATHER_RESPONSE,
+            "webSearch": MOCK_STORE_HOURS_SEARCH,
+        })
+
+        with patch('jarvis.reply.engine.run_tool_with_retries', side_effect=mock_tool_run), \
+             patch('jarvis.reply.engine.get_location_context_with_timezone', return_value=("Location: Kensington, Royal Kensington and Chelsea, United Kingdom", None)):
+
+            # Turn 1: Weather query
+            capture.clear()
+            response1 = run_reply_engine(
+                db=eval_db, cfg=mock_config, tts=None,
+                text="How's the weather today?",
+                dialogue_memory=eval_dialogue_memory
+            )
+            turn1_tools = capture.tool_sequence()
+
+            # Turn 2: Store hours query (topic change)
+            capture.clear()
+            response2 = run_reply_engine(
+                db=eval_db, cfg=mock_config, tts=None,
+                text="Yeah, I could do but can you check how long CEX is open for?",
+                dialogue_memory=eval_dialogue_memory
+            )
+            turn2_tools = capture.tool_sequence()
+
+        print(f"\n📊 Topic Switching - Weather → Store Hours:")
+        print(f"   Turn 1 query: 'How's the weather today?'")
+        print(f"   Turn 1 tools: {turn1_tools}")
+        print(f"   Turn 1 response: {response1[:100] if response1 else 'None'}...")
+        print(f"   Turn 2 query: 'can you check how long CEX is open for?'")
+        print(f"   Turn 2 tools: {turn2_tools}")
+        print(f"   Turn 2 response: {response2[:100] if response2 else 'None'}...")
+
+        # Turn 1 should use getWeather
+        assert "getWeather" in turn1_tools, \
+            f"Turn 1 should use getWeather for weather query. Used: {turn1_tools}"
+
+        # Turn 2 MUST use webSearch, NOT getWeather
+        # This is the critical assertion - the model should recognize topic change
+        used_wrong_tool = "getWeather" in turn2_tools and "webSearch" not in turn2_tools
+
+        if used_wrong_tool:
+            pytest.fail(
+                f"❌ CONTEXT ANCHORING BUG: Model used getWeather for store hours!\n"
+                f"   Turn 2 tools: {turn2_tools}\n"
+                f"   Expected: webSearch\n"
+                f"   The model got 'stuck' on the previous turn's tool.\n"
+                f"   Response: {response2[:200] if response2 else 'None'}"
+            )
+
+        assert "webSearch" in turn2_tools, \
+            f"Turn 2 should use webSearch for store hours. Used: {turn2_tools}"
+
+        print(f"   ✅ Correctly switched from getWeather to webSearch")
+
+    @pytest.mark.eval
+    @requires_judge_llm
+    def test_search_then_weather(self, mock_config, eval_db, eval_dialogue_memory):
+        """
+        After a web search, asking about weather should use getWeather.
+
+        Tests the reverse direction - ensuring the model doesn't stay stuck
+        on webSearch when weather is asked.
+        """
+        from jarvis.reply.engine import run_reply_engine
+
+        mock_config.ollama_base_url = "http://localhost:11434"
+        mock_config.ollama_chat_model = JUDGE_MODEL
+
+        capture = ToolCallCapture()
+        mock_tool_run = create_mock_tool_run(capture, {
+            "getWeather": MOCK_WEATHER_RESPONSE,
+            "webSearch": MOCK_NEWS_SEARCH,
+        })
+
+        with patch('jarvis.reply.engine.run_tool_with_retries', side_effect=mock_tool_run), \
+             patch('jarvis.reply.engine.get_location_context_with_timezone', return_value=("Location: Kensington, UK", None)):
+
+            # Turn 1: News search
+            capture.clear()
+            run_reply_engine(
+                db=eval_db, cfg=mock_config, tts=None,
+                text="What's the latest tech news?",
+                dialogue_memory=eval_dialogue_memory
+            )
+            turn1_tools = capture.tool_sequence()
+
+            # Turn 2: Weather
+            capture.clear()
+            response2 = run_reply_engine(
+                db=eval_db, cfg=mock_config, tts=None,
+                text="How's the weather outside?",
+                dialogue_memory=eval_dialogue_memory
+            )
+            turn2_tools = capture.tool_sequence()
+
+        print(f"\n📊 Topic Switching - News → Weather:")
+        print(f"   Turn 1 tools: {turn1_tools}")
+        print(f"   Turn 2 tools: {turn2_tools}")
+
+        assert "webSearch" in turn1_tools, \
+            f"Turn 1 should use webSearch for news. Used: {turn1_tools}"
+
+        # Check for reverse anchoring
+        if "webSearch" in turn2_tools and "getWeather" not in turn2_tools:
+            pytest.fail(
+                f"❌ CONTEXT ANCHORING BUG: Model used webSearch for weather query!\n"
+                f"   Turn 2 tools: {turn2_tools}\n"
+                f"   Response: {response2[:200] if response2 else 'None'}"
+            )
+
+        assert "getWeather" in turn2_tools, \
+            f"Turn 2 should use getWeather for weather query. Used: {turn2_tools}"
+
+        print(f"   ✅ Correctly switched from webSearch to getWeather")
+
+
+# =============================================================================
+# Follow-Up Context Evaluations (Live LLM)
+# =============================================================================
+
+class TestFollowUpContext:
+    """
+    Tests that the agent maintains context from previous turns
+    when handling follow-up questions.
+    """
+
+    @pytest.mark.eval
+    @requires_judge_llm
+    def test_follow_up_references_previous_context(self, mock_config, eval_db, eval_dialogue_memory):
+        """
+        Follow-up questions should reference information from previous turns.
+
+        Scenario:
+        - Turn 1: "How's the weather?" -> (gets weather data showing overcast, 7.8°C)
+        - Turn 2: "Should I bring an umbrella?" -> Response should reference weather
+
+        The model should use the weather context to inform the umbrella advice.
+        """
+        from jarvis.reply.engine import run_reply_engine
+
+        mock_config.ollama_base_url = "http://localhost:11434"
+        mock_config.ollama_chat_model = JUDGE_MODEL
+
+        capture = ToolCallCapture()
+        mock_tool_run = create_mock_tool_run(capture, {"getWeather": MOCK_WEATHER_RESPONSE})
+
+        with patch('jarvis.reply.engine.run_tool_with_retries', side_effect=mock_tool_run), \
+             patch('jarvis.reply.engine.get_location_context_with_timezone', return_value=("Location: Kensington, UK", None)):
+
+            # Turn 1: Weather query
+            capture.clear()
+            response1 = run_reply_engine(
+                db=eval_db, cfg=mock_config, tts=None,
+                text="How's the weather today?",
+                dialogue_memory=eval_dialogue_memory
+            )
+            turn1_tools = capture.tool_sequence()
+
+            # Turn 2: Follow-up about umbrella
+            capture.clear()
+            response2 = run_reply_engine(
+                db=eval_db, cfg=mock_config, tts=None,
+                text="Should I bring an umbrella?",
+                dialogue_memory=eval_dialogue_memory
+            )
+            turn2_tools = capture.tool_sequence()
+
+        print(f"\n📊 Follow-Up Context - Weather → Umbrella:")
+        print(f"   Turn 1 tools: {turn1_tools}")
+        print(f"   Turn 1 response: {response1[:80] if response1 else 'None'}...")
+        print(f"   Turn 2 tools: {turn2_tools}")
+        print(f"   Turn 2 response: {response2[:120] if response2 else 'None'}...")
+
+        # Turn 1 should fetch weather
+        assert "getWeather" in turn1_tools, "Turn 1 should fetch weather"
+
+        # Turn 2: Check if response references weather context
+        # (It may or may not call getWeather again - both are acceptable)
+        if response2:
+            weather_terms = ["overcast", "cloud", "rain", "weather", "chilly", "cold", "7", "8"]
+            references_weather = any(term in response2.lower() for term in weather_terms)
+            print(f"   References weather context: {references_weather}")
+
+            # The response should acknowledge or use the weather context
+            # Not a hard fail if it doesn't, but we log it
+            if not references_weather:
+                print(f"   ⚠️ Response doesn't seem to reference weather context")
+
+
+# =============================================================================
+# Self-Contained Tool Argument Evaluations (Live LLM)
+# =============================================================================
+
+
+MOCK_HARRY_STYLES_SEARCH = """Web search results for 'Harry Styles':
+
+**Content from top result:**
+Harry Styles is an English singer and songwriter, born 1 February 1994.
+He rose to fame as a member of the boy band One Direction and has since
+released several solo albums including Fine Line (2019) and Harry's House (2022).
+
+**Other search results:**
+1. **Harry Styles - Wikipedia** - https://en.wikipedia.org/wiki/Harry_Styles
+"""
+
+MOCK_HARRY_STYLES_SONGS_SEARCH = """Web search results for 'Harry Styles most famous songs':
+
+**Content from top result:**
+Harry Styles' most famous songs include:
+- "Watermelon Sugar" (2019)
+- "As It Was" (2022)
+- "Sign of the Times" (2017)
+- "Adore You" (2019)
+
+**Other search results:**
+1. **Harry Styles Discography** - https://en.wikipedia.org/wiki/Harry_Styles_discography
+"""
+
+
+class TestSelfContainedToolArguments:
+    """
+    Tests that follow-up queries with unresolved pronouns produce tool calls
+    whose arguments resolve the referent from conversation history.
+
+    A tool does not see prior turns — if the model passes "what are his most
+    famous songs?" to webSearch, the search will miss the entity and return
+    irrelevant results. The model must rewrite the argument to something like
+    "Harry Styles most famous songs".
+    """
+
+    @pytest.mark.eval
+    @requires_judge_llm
+    def test_follow_up_resolves_pronoun_in_search_query(
+        self, mock_config, eval_db, eval_dialogue_memory
+    ):
+        """
+        Scenario:
+        - Turn 1: "Who is Harry Styles?" -> webSearch("Harry Styles ...")
+        - Turn 2: "What are his most famous songs?" -> webSearch argument
+                  MUST contain "Harry Styles" (pronoun resolved from context).
+        """
+        from jarvis.reply.engine import run_reply_engine
+
+        mock_config.ollama_base_url = "http://localhost:11434"
+        mock_config.ollama_chat_model = JUDGE_MODEL
+
+        capture = ToolCallCapture()
+
+        def mock_tool_run(db, cfg, tool_name, tool_args, **kwargs):
+            from jarvis.tools.types import ToolExecutionResult
+            capture.record(tool_name, tool_args or {})
+            if tool_name == "webSearch":
+                args_str = str(tool_args).lower() if tool_args else ""
+                if "song" in args_str or "music" in args_str or "album" in args_str:
+                    return ToolExecutionResult(success=True, reply_text=MOCK_HARRY_STYLES_SONGS_SEARCH)
+                return ToolExecutionResult(success=True, reply_text=MOCK_HARRY_STYLES_SEARCH)
+            return ToolExecutionResult(success=True, reply_text="OK")
+
+        with patch('jarvis.reply.engine.run_tool_with_retries', side_effect=mock_tool_run), \
+             patch('jarvis.reply.engine.get_location_context_with_timezone', return_value=("Location: Kensington, UK", None)):
+
+            # Turn 1: establish entity
+            capture.clear()
+            run_reply_engine(
+                db=eval_db, cfg=mock_config, tts=None,
+                text="Who is Harry Styles?",
+                dialogue_memory=eval_dialogue_memory
+            )
+            turn1_calls = list(capture.calls)
+
+            # Turn 2: follow-up with pronoun
+            capture.clear()
+            response2 = run_reply_engine(
+                db=eval_db, cfg=mock_config, tts=None,
+                text="What are his most famous songs?",
+                dialogue_memory=eval_dialogue_memory
+            )
+            turn2_calls = list(capture.calls)
+
+        print(f"\n📊 Self-contained tool arguments — Harry Styles follow-up:")
+        print(f"   Turn 1 calls: {turn1_calls}")
+        print(f"   Turn 2 calls: {turn2_calls}")
+        print(f"   Turn 2 response: {(response2 or '')[:120]}...")
+
+        # Turn 2 must call a search-capable tool
+        search_calls = [c for c in turn2_calls if c["name"] == "webSearch"]
+        assert search_calls, (
+            f"Turn 2 should call webSearch to answer the follow-up. "
+            f"Got: {[c['name'] for c in turn2_calls]}"
+        )
+
+        # Every search call's string argument must name the entity
+        for call in search_calls:
+            args = call["args"] or {}
+            arg_values = " ".join(
+                str(v) for v in args.values() if isinstance(v, str)
+            ).lower()
+            assert "harry" in arg_values or "styles" in arg_values, (
+                f"❌ PRONOUN-RESOLUTION BUG: webSearch argument did not include "
+                f"the entity from the previous turn.\n"
+                f"   Args: {args}\n"
+                f"   Expected the string to contain 'Harry' or 'Styles' — the "
+                f"tool has no access to conversation history, so 'his' must be "
+                f"resolved by the model before the tool call."
+            )
+
+        print(f"   ✅ webSearch argument resolved the pronoun correctly")
+
+
+# =============================================================================
+# Extended Multi-Turn Evaluations (Live LLM)
+# =============================================================================
+
+class TestMultiTurnExtended:
+    """
+    Extended multi-turn scenarios testing longer conversations
+    and more complex topic changes.
+    """
+
+    @pytest.mark.eval
+    @requires_judge_llm
+    def test_three_turn_topic_changes(self, mock_config, eval_db, eval_dialogue_memory):
+        """
+        Three-turn conversation with multiple topic changes.
+
+        Turn 1: Weather query
+        Turn 2: Store hours query (topic change from weather)
+        Turn 3: News query (topic change from store)
+
+        Each turn should select the appropriate tool.
+        """
+        from jarvis.reply.engine import run_reply_engine
+
+        mock_config.ollama_base_url = "http://localhost:11434"
+        mock_config.ollama_chat_model = JUDGE_MODEL
+
+        capture = ToolCallCapture()
+        all_turns = []
+
+        def mock_tool_run(db, cfg, tool_name, tool_args, **kwargs):
+            from jarvis.tools.types import ToolExecutionResult
+            capture.record(tool_name, tool_args or {})
+
+            if tool_name == "getWeather":
+                return ToolExecutionResult(success=True, reply_text=MOCK_WEATHER_RESPONSE)
+            elif tool_name == "webSearch":
+                # Return appropriate content based on query
+                args_str = str(tool_args).lower() if tool_args else ""
+                if "cex" in args_str or "store" in args_str or "hour" in args_str:
+                    return ToolExecutionResult(success=True, reply_text=MOCK_STORE_HOURS_SEARCH)
+                else:
+                    return ToolExecutionResult(success=True, reply_text=MOCK_NEWS_SEARCH)
+            return ToolExecutionResult(success=True, reply_text="OK")
+
+        with patch('jarvis.reply.engine.run_tool_with_retries', side_effect=mock_tool_run), \
+             patch('jarvis.reply.engine.get_location_context_with_timezone', return_value=("Location: Kensington, UK", None)):
+
+            queries = [
+                ("How's the weather today?", "getWeather"),
+                ("What time does CEX close?", "webSearch"),
+                ("What's happening in tech news?", "webSearch"),
+            ]
+
+            for query, expected_tool in queries:
+                capture.clear()
+                response = run_reply_engine(
+                    db=eval_db, cfg=mock_config, tts=None,
+                    text=query,
+                    dialogue_memory=eval_dialogue_memory
+                )
+                all_turns.append({
+                    "query": query,
+                    "expected": expected_tool,
+                    "tools": capture.tool_sequence().copy(),
+                    "response": response
+                })
+
+        print(f"\n📊 Three-Turn Topic Changes:")
+        failures = []
+        for i, turn in enumerate(all_turns, 1):
+            tools = turn["tools"]
+            expected = turn["expected"]
+            has_expected = expected in tools
+
+            status = "✅" if has_expected else "❌"
+            print(f"   Turn {i}: '{turn['query'][:35]}...'")
+            print(f"      Expected: {expected}, Got: {tools} {status}")
+
+            if not has_expected:
+                # Check for context anchoring specifically
+                if i > 1 and all_turns[i-2]["expected"] in tools:
+                    failures.append(
+                        f"Turn {i}: Context anchoring bug - used {tools} (previous turn's tool) "
+                        f"instead of {expected}"
+                    )
+                else:
+                    failures.append(f"Turn {i}: Expected {expected}, got {tools}")
+
+        if failures:
+            pytest.fail(
+                f"❌ Multi-turn tool selection failures:\n" +
+                "\n".join(f"   - {f}" for f in failures)
+            )
+
+        print(f"   ✅ All turns selected correct tools")
+

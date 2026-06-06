@@ -1,0 +1,2687 @@
+"""
+Jarvis Desktop App - System Tray Application
+
+A cross-platform system tray app for controlling the Jarvis voice assistant.
+Supports Windows, Ubuntu (Linux), and macOS.
+"""
+
+from __future__ import annotations
+import sys
+import os
+import time
+
+# Fix OpenBLAS threading crash in bundled apps
+# Must be set before numpy is imported (via faster-whisper, etc.)
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+
+# Suppress pkg_resources deprecation warning from webrtcvad
+import warnings
+warnings.filterwarnings('ignore', message='pkg_resources is deprecated',
+                        category=UserWarning)
+
+# Note: QtWebEngine is not used on macOS bundled apps due to sandbox/bundling issues
+# The Memory Viewer opens in the system browser instead (see MemoryViewerWindow)
+
+import subprocess
+import signal
+import psutil
+import threading
+import traceback
+import atexit
+import webbrowser
+import urllib.parse
+from pathlib import Path
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from desktop_app.cuda_recovery import CudaRecoveryAction
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMainWindow, QTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QDialog, QPushButton
+from PyQt6.QtGui import QIcon, QAction, QFont, QTextCursor
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QObject, QThread, QUrl
+
+# Global lock file handle (must remain open for the lock to persist)
+_lock_file_handle = None
+# Byte offset used for the lock region — deliberately beyond where PID content
+# lives (bytes 0–~10) so other processes can still read the PID while the lock
+# is held.  Windows msvcrt.locking() creates mandatory locks that block ALL
+# access (including reads from other handles) on the locked bytes, so locking
+# at byte 0 would make the PID unreadable by a second instance.
+_LOCK_OFFSET = 1024
+
+# Try to import WebEngine (optional dependency for embedded memory viewer)
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    HAS_WEBENGINE = True
+except ImportError:
+    HAS_WEBENGINE = False
+    QWebEngineView = None
+
+from jarvis.debug import debug_log
+from jarvis.config import default_config_path, _default_db_path, SUPPORTED_CHAT_MODELS, get_supported_model_ids
+from desktop_app.diary_dialog import DiaryUpdateDialog
+from desktop_app.themes import JARVIS_THEME_STYLESHEET
+from desktop_app.face_widget import FaceWindow
+
+
+_LOG_SEPARATOR = "─" * 50
+
+
+def _trim_extension_modules(logs: str) -> str:
+    """Shorten the faulthandler 'Extension modules:' line to a brief summary.
+
+    This line typically consumes 1500-2500 chars of module names that rarely
+    help with crash diagnosis.  Replacing it frees space for the critical
+    'Fatal Python error' header and current-thread stack trace.
+    """
+    import re
+    # Match "Extension modules: mod1, mod2, ... (total: N)\n"
+    m = re.search(
+        r'^(Extension modules:) [^\n]+\(total: (\d+)\)\s*$',
+        logs, re.MULTILINE,
+    )
+    if m:
+        return logs[:m.start()] + f"{m.group(1)} ({m.group(2)} total — trimmed for brevity)\n" + logs[m.end():]
+
+    # Fallback: line without "(total: N)" — just truncate after first few modules
+    m = re.search(
+        r'^(Extension modules:) (.{80}).+$',
+        logs, re.MULTILINE,
+    )
+    if m:
+        return logs[:m.start()] + f"{m.group(1)} {m.group(2)}... (trimmed)\n" + logs[m.end():]
+
+    return logs
+
+
+def _extract_fatal_section(logs: str) -> str:
+    """Extract the 'Fatal Python error' header + current thread stack.
+
+    In faulthandler dumps these lines carry the actual crash cause and
+    appear between the fatal error line and the first other thread
+    (i.e. the first ``Thread 0x`` header after ``Current thread 0x``).
+    Returns "" if not found.
+    """
+    import re
+    # Find "Fatal Python error: ..." line
+    m = re.search(r'^Fatal Python error: .+$', logs, re.MULTILINE)
+    if not m:
+        return ""
+
+    start = m.start()
+
+    # Grab everything up to (but not including) the first "Thread 0x" header.
+    # "Current thread 0x..." uses a different prefix so won't match here.
+    rest = logs[start:]
+    first_other_thread = next(re.finditer(r'^Thread 0x', rest, re.MULTILINE), None)
+    if first_other_thread:
+        end = start + first_other_thread.start()
+    else:
+        # No other thread header — take up to 500 chars
+        end = start + min(500, len(rest))
+
+    return logs[start:end].rstrip() + "\n"
+
+
+def _snap_to_line_boundary(text: str) -> str:
+    """Advance past a partial first line so truncated output starts cleanly."""
+    newline_idx = text.find('\n')
+    if newline_idx != -1 and newline_idx < 200:
+        return text[newline_idx + 1:]
+    return text
+
+
+def _truncate_logs_for_report(logs: str, max_len: int) -> str:
+    """Truncate logs keeping init section + recent tail.
+
+    Recent logs are more valuable for debugging, so we preserve the tail.
+    The init section (everything up to the last separator line) is kept
+    for context (version, platform, configuration info).
+
+    For faulthandler crash dumps, the bulky 'Extension modules:' line is
+    trimmed first and the 'Fatal Python error' header + current thread
+    stack are preserved as a priority section so the root cause survives
+    truncation.
+    """
+    # Trim the Extension modules line before size check — it wastes ~1700
+    # chars of budget on module names that almost never help diagnose a crash.
+    if "Extension modules:" in logs:
+        logs = _trim_extension_modules(logs)
+
+    if len(logs) <= max_len:
+        return logs
+
+    marker = "\n\n... (truncated) ...\n\n"
+
+    # Find the init section: everything up to and including the last separator line
+    last_sep = logs.rfind(_LOG_SEPARATOR)
+    if last_sep != -1:
+        init_end = logs.find('\n', last_sep)
+        if init_end == -1:
+            init_end = last_sep + len(_LOG_SEPARATOR)
+        else:
+            init_end += 1  # Include the newline
+        init_section = logs[:init_end]
+    else:
+        # No separator found (e.g. crash logs); skip init preservation
+        init_section = ""
+
+    # For faulthandler dumps, extract the fatal error + current thread stack
+    # as a second must-keep section (the most diagnostic part of the dump).
+    fatal_section = _extract_fatal_section(logs)
+
+    # Cap fatal_section so it never alone exceeds the budget
+    fatal_cap = max(0, max_len - len(marker) - 200)  # leave room for tail
+    if len(fatal_section) > fatal_cap:
+        fatal_section = fatal_section[:fatal_cap].rstrip() + "\n"
+
+    if len(init_section) + len(fatal_section) + len(marker) * 2 >= max_len:
+        # Budget too tight — keep fatal section + tail only
+        if fatal_section:
+            tail_budget = max(0, max_len - len(fatal_section) - len(marker))
+            if tail_budget == 0:
+                return fatal_section[:max_len]
+            tail_part = _snap_to_line_boundary(logs[-tail_budget:])
+            return fatal_section + marker + tail_part
+
+        # No fatal section — just keep the tail
+        tail_budget = max(0, max_len - len(marker))
+        tail_part = _snap_to_line_boundary(logs[-tail_budget:])
+        return marker.lstrip() + tail_part
+
+    # Build: init_section + marker + fatal_section + marker + tail
+    fixed_parts = init_section + marker + fatal_section
+    if fatal_section:
+        fixed_parts += marker
+
+    tail_budget = max(0, max_len - len(fixed_parts))
+    tail_part = _snap_to_line_boundary(logs[-tail_budget:])
+
+    return fixed_parts + tail_part
+
+
+def setup_crash_logging():
+    """Set up crash logging for the bundled app to capture startup errors."""
+    if getattr(sys, 'frozen', False):
+        # Running as bundled app - use shared crash path helper
+        crash_log, _, _ = get_crash_paths()
+        log_file = crash_log
+        log_dir = log_file.parent
+
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            # Redirect stdout and stderr to log file with line buffering for immediate writes
+            # buffering=1 means line-buffered mode (flush on newline)
+            log_handle = open(log_file, 'w', encoding='utf-8', buffering=1)
+            sys.stdout = log_handle
+            sys.stderr = log_handle
+
+            # Enable faulthandler to dump Python traceback on segfaults/aborts
+            # This catches SIGSEGV, SIGFPE, SIGABRT, SIGBUS, SIGILL
+            import faulthandler
+            faulthandler.enable(file=log_handle)
+
+            print(f"=== Jarvis Desktop App Crash Log ===", flush=True)
+            print(f"Timestamp: {__import__('datetime').datetime.now()}", flush=True)
+            print(f"Platform: {sys.platform}", flush=True)
+            print(f"Python: {sys.version}", flush=True)
+            print(f"Executable: {sys.executable}", flush=True)
+            print(f"Frozen: {getattr(sys, 'frozen', False)}", flush=True)
+            print(f"Bundle dir: {getattr(sys, '_MEIPASS', 'N/A')}", flush=True)
+            print("=" * 50, flush=True)
+            print(f"📁 This log: {log_file}", flush=True)
+            if sys.platform == "darwin":
+                print(f"📁 System crash reports: ~/Library/Logs/DiagnosticReports/", flush=True)
+            elif sys.platform == "win32":
+                print(f"📁 Windows Event Viewer: eventvwr.msc → Windows Logs → Application", flush=True)
+            print("=" * 50, flush=True)
+            print(flush=True)
+
+            return log_file
+        except Exception as e:
+            # If we can't set up logging, at least try to show a dialog
+            return None
+    return None
+
+
+def get_crash_paths() -> tuple[Path, Path, Path]:
+    """Get paths for crash log, marker, and previous crash log."""
+    from desktop_app.paths import get_log_dir
+    log_dir = get_log_dir()
+
+    crash_log = log_dir / "jarvis_desktop_crash.log"
+    crash_marker = log_dir / ".crash_marker"
+    previous_crash = log_dir / "previous_crash.log"
+
+    return crash_log, crash_marker, previous_crash
+
+
+def check_previous_crash() -> Optional[str]:
+    """
+    Check if previous session crashed and return crash details if so.
+
+    Returns crash log content if previous session crashed, None otherwise.
+    """
+    try:
+        crash_log, crash_marker, previous_crash = get_crash_paths()
+
+        if crash_marker.exists():
+            # Previous session didn't exit cleanly
+            crash_marker.unlink()
+
+            crash_content = None
+
+            # Check for crash log content
+            if crash_log.exists():
+                content = crash_log.read_text(encoding='utf-8', errors='replace')
+                # Only report if there's actual crash info (faulthandler output or errors)
+                if 'Fatal' in content or 'Error' in content or 'Traceback' in content:
+                    crash_content = content
+                    # Save to previous_crash for reference
+                    previous_crash.write_text(content, encoding='utf-8')
+
+            return crash_content
+
+        return None
+    except Exception:
+        return None
+
+
+def mark_session_started():
+    """Mark that a session has started (for crash detection)."""
+    try:
+        _, crash_marker, _ = get_crash_paths()
+        crash_marker.touch()
+    except Exception:
+        pass
+
+
+def mark_session_clean_exit():
+    """Mark that session exited cleanly (remove crash marker)."""
+    try:
+        _, crash_marker, _ = get_crash_paths()
+        crash_marker.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def show_crash_report_dialog(crash_content: str) -> None:
+    """
+    Show a dialog offering to submit a crash report to GitHub.
+
+    Args:
+        crash_content: The crash log content to include in the report.
+    """
+    try:
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+            QPushButton, QTextEdit, QCheckBox
+        )
+        from PyQt6.QtCore import Qt
+        import webbrowser
+        import urllib.parse
+        from jarvis import get_version
+
+        class CrashReportDialog(QDialog):
+            def __init__(self, crash_info: str):
+                super().__init__()
+                self.crash_info = crash_info
+                self.setWindowTitle("🐛 Jarvis Crash Report")
+                self.setMinimumSize(600, 450)
+                self.setStyleSheet(JARVIS_THEME_STYLESHEET)
+                self._setup_ui()
+
+            def _setup_ui(self):
+                layout = QVBoxLayout(self)
+                layout.setSpacing(16)
+
+                # Header
+                header = QLabel("😵 Jarvis crashed in the previous session")
+                header.setStyleSheet("font-size: 18px; font-weight: bold; color: #f87171;")
+                layout.addWidget(header)
+
+                # Description
+                desc = QLabel(
+                    "Would you like to report this crash? This helps us fix bugs faster.\n"
+                    "The report will open as a GitHub issue (you can review before submitting)."
+                )
+                desc.setWordWrap(True)
+                desc.setStyleSheet("color: #a1a1aa;")
+                layout.addWidget(desc)
+
+                # Crash log preview
+                preview_label = QLabel("📋 Crash details (will be included in report):")
+                preview_label.setStyleSheet("color: #71717a; margin-top: 8px;")
+                layout.addWidget(preview_label)
+
+                self.log_preview = QTextEdit()
+                self.log_preview.setPlainText(self.crash_info[:3000])  # Limit preview
+                self.log_preview.setReadOnly(True)
+                self.log_preview.setStyleSheet("""
+                    QTextEdit {
+                        background-color: #18181b;
+                        color: #a1a1aa;
+                        font-family: monospace;
+                        font-size: 11px;
+                        border: 1px solid #27272a;
+                        border-radius: 4px;
+                    }
+                """)
+                self.log_preview.setMaximumHeight(200)
+                layout.addWidget(self.log_preview)
+
+                # Privacy note
+                privacy = QLabel(
+                    "ℹ️ No personal data is collected. You control what's submitted via GitHub."
+                )
+                privacy.setStyleSheet("color: #71717a; font-size: 11px;")
+                layout.addWidget(privacy)
+
+                # Buttons
+                btn_layout = QHBoxLayout()
+                btn_layout.addStretch()
+
+                dismiss_btn = QPushButton("Dismiss")
+                dismiss_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #27272a;
+                        color: #a1a1aa;
+                        border: none;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                    }
+                    QPushButton:hover {
+                        background-color: #3f3f46;
+                    }
+                """)
+                dismiss_btn.clicked.connect(self.reject)
+                btn_layout.addWidget(dismiss_btn)
+
+                report_btn = QPushButton("📝 Report on GitHub")
+                report_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2563eb;
+                        color: white;
+                        border: none;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #3b82f6;
+                    }
+                """)
+                report_btn.clicked.connect(self._open_github_issue)
+                btn_layout.addWidget(report_btn)
+
+                layout.addLayout(btn_layout)
+
+            def _open_github_issue(self):
+                """Open GitHub issue with crash details pre-filled."""
+                try:
+                    version = get_version()
+                except Exception:
+                    version = "unknown"
+
+                # Truncate crash info for URL (GitHub has limits)
+                # Keep init lines + recent tail (recent logs are most useful for debugging)
+                truncated = _truncate_logs_for_report(self.crash_info, 4000)
+                # Escape backtick fences so log content can't break out of the code block
+                truncated = truncated.replace('```', '`` `')
+
+                title = "Crash Report"
+                body = f"""## Crash Report
+
+**Version:** {version}
+**Platform:** {sys.platform}
+
+### Crash Log
+```
+{truncated}
+```
+
+### Steps to Reproduce
+(Please describe what you were doing when the crash occurred)
+
+1.
+2.
+3.
+
+### Additional Context
+(Any other relevant information)
+"""
+                # URL encode
+                params = urllib.parse.urlencode({
+                    'title': title,
+                    'body': body,
+                    'labels': 'bug,crash'
+                })
+                url = f"https://github.com/isair/jarvis/issues/new?{params}"
+
+                webbrowser.open(url)
+                self.accept()
+
+        dialog = CrashReportDialog(crash_content)
+        dialog.exec()
+
+    except Exception as e:
+        debug_log(f"failed to show crash report dialog: {e}", "desktop")
+
+
+def check_model_support() -> Optional[str]:
+    """
+    Check if the configured chat model is officially supported.
+
+    Returns the model name if unsupported, None if supported.
+    """
+    try:
+        from jarvis.config import load_config, DEFAULT_CHAT_MODEL
+        config = load_config()
+        model = config.get("ollama_chat_model", DEFAULT_CHAT_MODEL)
+
+        # Normalize model name (remove tag if it matches base)
+        base_model = model.split(":")[0] if ":" in model else model
+
+        # Check against supported models (also check base name)
+        supported_ids = get_supported_model_ids()
+        for supported in supported_ids:
+            supported_base = supported.split(":")[0]
+            if model == supported or base_model == supported_base:
+                return None
+
+        return model
+    except Exception:
+        return None
+
+
+def show_unsupported_model_dialog(model_name: str) -> bool:
+    """
+    Show a dialog warning about unsupported model.
+
+    Args:
+        model_name: The name of the unsupported model.
+
+    Returns:
+        True if user wants to open setup wizard, False to continue anyway.
+    """
+    try:
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+
+        class UnsupportedModelDialog(QDialog):
+            def __init__(self, model: str):
+                super().__init__()
+                self.model = model
+                self.open_wizard = False
+                self.setWindowTitle("⚠️ Unsupported Model")
+                self.setMinimumWidth(500)
+                self.setStyleSheet(JARVIS_THEME_STYLESHEET)
+                self._setup_ui()
+
+            def _setup_ui(self):
+                layout = QVBoxLayout(self)
+                layout.setSpacing(16)
+                layout.setContentsMargins(24, 24, 24, 24)
+
+                # Header
+                header = QLabel("⚠️ Using Unofficial Model")
+                header.setStyleSheet("font-size: 18px; font-weight: bold; color: #fbbf24;")
+                layout.addWidget(header)
+
+                # Description
+                supported_list = ", ".join(sorted(SUPPORTED_CHAT_MODELS))
+                desc = QLabel(
+                    f"You're using <b>{self.model}</b> which hasn't been tested with Jarvis.\n\n"
+                    f"Officially supported models: <b>{supported_list}</b>\n\n"
+                    "Other models may work but could have issues with tool calling, "
+                    "response formatting, or performance."
+                )
+                desc.setWordWrap(True)
+                desc.setStyleSheet("color: #a1a1aa; line-height: 1.5;")
+                desc.setTextFormat(desc.textFormat().RichText)
+                layout.addWidget(desc)
+
+                layout.addSpacing(8)
+
+                # Buttons
+                btn_layout = QHBoxLayout()
+                btn_layout.addStretch()
+
+                continue_btn = QPushButton("Continue Anyway")
+                continue_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #27272a;
+                        color: #a1a1aa;
+                        border: none;
+                        padding: 10px 20px;
+                        border-radius: 4px;
+                    }
+                    QPushButton:hover {
+                        background-color: #3f3f46;
+                    }
+                """)
+                continue_btn.clicked.connect(self.accept)
+                btn_layout.addWidget(continue_btn)
+
+                wizard_btn = QPushButton("🔧 Open Setup Wizard")
+                wizard_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2563eb;
+                        color: white;
+                        border: none;
+                        padding: 10px 20px;
+                        border-radius: 4px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #3b82f6;
+                    }
+                """)
+                wizard_btn.clicked.connect(self._open_wizard)
+                btn_layout.addWidget(wizard_btn)
+
+                layout.addLayout(btn_layout)
+
+            def _open_wizard(self):
+                self.open_wizard = True
+                self.accept()
+
+        dialog = UnsupportedModelDialog(model_name)
+        dialog.exec()
+        return dialog.open_wizard
+
+    except Exception as e:
+        debug_log(f"failed to show unsupported model dialog: {e}", "desktop")
+        return False
+
+
+def get_lock_file_path() -> Path:
+    """Get the path to the single-instance lock file."""
+    if sys.platform == "darwin":
+        lock_dir = Path.home() / "Library" / "Application Support" / "Jarvis"
+    elif sys.platform == "win32":
+        lock_dir = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Jarvis"
+    else:
+        lock_dir = Path.home() / ".jarvis"
+
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return lock_dir / "jarvis_desktop.lock"
+
+
+def get_existing_instance_pid() -> Optional[int]:
+    """Read the PID of the existing Jarvis instance from the lock file."""
+    lock_file = get_lock_file_path()
+    try:
+        if lock_file.exists():
+            content = lock_file.read_text().strip()
+            if content.isdigit():
+                return int(content)
+    except Exception:
+        pass
+    return None
+
+
+def kill_existing_instance(pid: int) -> bool:
+    """
+    Terminate an existing Jarvis instance by PID.
+
+    Returns True if the process was terminated, False otherwise.
+    """
+    try:
+        process = psutil.Process(pid)
+        # Verify it's actually a Jarvis process (safety check)
+        proc_name = process.name().lower()
+        if "jarvis" not in proc_name and "python" not in proc_name:
+            debug_log(f"PID {pid} doesn't look like Jarvis (name: {proc_name}), not killing", "desktop")
+            return False
+
+        debug_log(f"Terminating existing Jarvis instance (PID {pid})", "desktop")
+        process.terminate()
+
+        # Wait up to 5 seconds for graceful shutdown
+        try:
+            process.wait(timeout=5)
+        except psutil.TimeoutExpired:
+            debug_log(f"Process {pid} didn't terminate gracefully, force killing", "desktop")
+            process.kill()
+            process.wait(timeout=2)
+
+        return True
+    except psutil.NoSuchProcess:
+        # Process already gone
+        return True
+    except Exception as e:
+        debug_log(f"Failed to kill process {pid}: {e}", "desktop")
+        return False
+
+
+def show_instance_conflict_dialog() -> bool:
+    """
+    Show a dialog asking the user if they want to kill the existing instance.
+
+    Returns True if the user chose to kill, False to exit.
+    Must be called after QApplication is created.
+    """
+    from PyQt6.QtWidgets import QMessageBox
+    from PyQt6.QtGui import QIcon
+
+    msg = QMessageBox()
+    msg.setWindowTitle("Jarvis Already Running")
+    msg.setText("Another instance of Jarvis is already running.")
+    msg.setInformativeText("Would you like to close the existing instance and start a new one?")
+    msg.setIcon(QMessageBox.Icon.Question)
+
+    # Add custom buttons
+    kill_btn = msg.addButton("Close Existing && Start New", QMessageBox.ButtonRole.AcceptRole)
+    exit_btn = msg.addButton("Exit", QMessageBox.ButtonRole.RejectRole)
+    msg.setDefaultButton(kill_btn)
+
+    # Apply theme
+    from desktop_app.themes import JARVIS_THEME_STYLESHEET
+    msg.setStyleSheet(JARVIS_THEME_STYLESHEET)
+
+    msg.exec()
+
+    return msg.clickedButton() == kill_btn
+
+
+def acquire_single_instance_lock() -> bool:
+    """
+    Acquire a lock to ensure only one instance of the desktop app runs.
+
+    Returns True if lock acquired (we're the only instance), False otherwise.
+    The lock file handle is kept open globally to maintain the lock.
+    """
+    global _lock_file_handle
+
+    lock_file = get_lock_file_path()
+
+    try:
+        # Open in append+read binary mode — does NOT truncate the file.
+        # Opening with 'w' would truncate immediately, destroying the existing
+        # instance's PID before we even attempt the lock, making it unreadable.
+        _lock_file_handle = open(lock_file, 'a+b')
+
+        if sys.platform == "win32":
+            # Windows: use msvcrt for file locking.
+            # Lock at _LOCK_OFFSET (not byte 0) so the PID content at bytes
+            # 0–~10 remains readable by other processes.  msvcrt.locking()
+            # creates mandatory locks that block ALL I/O on the locked bytes.
+            import msvcrt
+            _lock_file_handle.seek(_LOCK_OFFSET)
+            try:
+                msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                # Lock failed — another instance is running
+                _lock_file_handle.close()
+                _lock_file_handle = None
+                return False
+        else:
+            # Unix (macOS, Linux): use fcntl for file locking
+            import fcntl
+            try:
+                fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (IOError, OSError):
+                # Lock failed - another instance is running
+                _lock_file_handle.close()
+                _lock_file_handle = None
+                return False
+
+        # Lock acquired — overwrite the file with our PID
+        _lock_file_handle.seek(0)
+        _lock_file_handle.truncate(0)
+        _lock_file_handle.write(str(os.getpid()).encode())
+        _lock_file_handle.flush()
+
+        # Register cleanup to release lock on exit
+        def release_lock():
+            global _lock_file_handle
+            if _lock_file_handle:
+                try:
+                    _lock_file_handle.close()
+                except Exception:
+                    pass
+                _lock_file_handle = None
+
+        atexit.register(release_lock)
+
+        return True
+
+    except Exception as e:
+        print(f"Warning: Could not acquire single-instance lock: {e}")
+        # On any error, allow the app to run (fail open)
+        return True
+
+
+class LogSignals(QObject):
+    """Signals for thread-safe log updates."""
+    new_log = pyqtSignal(str)
+
+
+class LogViewerWindow(QMainWindow):
+    """Window for viewing Jarvis logs in real-time."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("📝 Jarvis Logs")
+        self.setGeometry(100, 100, 900, 650)
+
+        # Apply theme
+        self.setStyleSheet(JARVIS_THEME_STYLESHEET)
+
+        # Create central widget and layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Header row with title on left, button on right
+        header_row = QWidget()
+        header_row_layout = QHBoxLayout(header_row)
+        header_row_layout.setContentsMargins(0, 0, 0, 8)
+        header_row_layout.setSpacing(12)
+
+        # Title and subtitle on the left
+        title_section = QWidget()
+        title_layout = QVBoxLayout(title_section)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(4)
+
+        title = QLabel("📝 Jarvis Logs")
+        title.setObjectName("title")
+        title.setStyleSheet("font-size: 20px; font-weight: 600; color: #fbbf24;")
+        title_layout.addWidget(title)
+
+        subtitle = QLabel("Real-time activity and debug output")
+        subtitle.setObjectName("subtitle")
+        title_layout.addWidget(subtitle)
+
+        header_row_layout.addWidget(title_section)
+        header_row_layout.addStretch()
+
+        # Clear button
+        clear_btn = QPushButton("🗑️ Clear")
+        clear_btn.setToolTip("Clear all logs")
+        clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #27272a;
+                color: #fafafa;
+                border: 1px solid #3f3f46;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #3f3f46;
+                border-color: #f59e0b;
+            }
+        """)
+        clear_btn.clicked.connect(self.clear_logs)
+        header_row_layout.addWidget(clear_btn)
+
+        # Report button on the right
+        report_btn = QPushButton("🐛 Report Issue")
+        report_btn.setToolTip("Report a bug or unexpected behavior on GitHub")
+        report_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #27272a;
+                color: #fafafa;
+                border: 1px solid #3f3f46;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #3f3f46;
+                border-color: #f59e0b;
+            }
+        """)
+        report_btn.clicked.connect(self._report_issue)
+        header_row_layout.addWidget(report_btn)
+
+        layout.addWidget(header_row)
+
+        # Create text display for logs with monospace font
+        self.log_display = QTextEdit()
+        self.log_display.setReadOnly(True)
+        mono_font = QFont("JetBrains Mono", 11) if sys.platform == "darwin" else QFont("Consolas", 10)
+        mono_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.log_display.setFont(mono_font)
+        layout.addWidget(self.log_display)
+
+        # Initial message
+        self.append_log("🚀 Jarvis Log Viewer Ready\n" + _LOG_SEPARATOR + "\n\n")
+
+    def append_log(self, text: str) -> None:
+        """Append text to the log display."""
+        self.log_display.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_display.insertPlainText(text)
+        self.log_display.moveCursor(QTextCursor.MoveOperation.End)
+
+    def clear_logs(self) -> None:
+        """Clear all logs."""
+        self.log_display.clear()
+        self.append_log("🗑️ Logs Cleared\n" + _LOG_SEPARATOR + "\n\n")
+
+    def _report_issue(self) -> None:
+        """Open GitHub issue with redacted log contents."""
+        from jarvis import get_version
+        from jarvis.utils.redact import _REDACTION_RULES
+
+        try:
+            version = get_version()
+        except Exception:
+            version = "unknown"
+
+        # Get all log content and redact sensitive information (preserving line breaks)
+        log_content = self.log_display.toPlainText()
+        redacted_logs = log_content
+        for pattern, repl in _REDACTION_RULES:
+            redacted_logs = pattern.sub(repl, redacted_logs)
+
+        # Truncate if too long for URL (GitHub has ~8000 char limit for URLs)
+        # Keep init lines + recent tail (recent logs are most useful for debugging)
+        redacted_logs = _truncate_logs_for_report(redacted_logs, 5000)
+        # Escape backtick fences so log content can't break out of the code block
+        redacted_logs = redacted_logs.replace('```', '`` `')
+
+        title = "Bug Report"
+        body = f"""## Bug Report
+
+**Version:** {version}
+**Platform:** {sys.platform}
+
+### Description
+(Please describe what went wrong or what you expected to happen)
+
+
+
+### Steps to Reproduce
+1.
+2.
+3.
+
+<details>
+<summary>📋 Logs (click to expand)</summary>
+
+```
+{redacted_logs}
+```
+
+</details>
+
+### Additional Context
+(Any other relevant information)
+"""
+        params = urllib.parse.urlencode({
+            'title': title,
+            'body': body,
+            'labels': 'bug'
+        })
+        url = f"https://github.com/isair/jarvis/issues/new?{params}"
+
+        webbrowser.open(url)
+
+
+class MemoryViewerWindow(QMainWindow):
+    """Window for viewing Jarvis memory using embedded web view."""
+
+    MEMORY_VIEWER_PORT = 5050
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("🧠 Jarvis Memory")
+        self.setGeometry(150, 150, 1200, 900)
+
+        # Apply theme
+        self.setStyleSheet(JARVIS_THEME_STYLESHEET)
+
+        self.server_process: Optional[subprocess.Popen] = None
+        self.server_thread: Optional[threading.Thread] = None
+        self.is_server_running = False
+
+        # Create central widget and layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Determine if we should use embedded WebEngine or browser fallback
+        # On macOS bundled apps, QtWebEngine crashes due to sandbox/bundling issues
+        # so we use the system browser instead. Windows works fine with WebEngine.
+        is_macos_bundle = sys.platform == 'darwin' and getattr(sys, 'frozen', False)
+        use_webengine = HAS_WEBENGINE and not is_macos_bundle
+
+        web_view_created = False
+        if use_webengine:
+            # Use embedded web view - URL will be set in showEvent when window is shown
+            try:
+                self.web_view = QWebEngineView()
+                layout.addWidget(self.web_view)
+                web_view_created = True
+            except Exception as e:
+                debug_log(f"failed to create QWebEngineView: {e}", "desktop")
+                self.web_view = None
+
+        if not web_view_created:
+            # Fallback: show message and open in browser
+            self.web_view = None
+
+            fallback_container = QWidget()
+            fallback_layout = QVBoxLayout(fallback_container)
+            fallback_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            icon_label = QLabel("🧠")
+            icon_label.setStyleSheet("font-size: 64px; background: transparent;")
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fallback_layout.addWidget(icon_label)
+
+            title_label = QLabel("Memory Viewer")
+            title_label.setStyleSheet("""
+                font-size: 24px;
+                font-weight: 600;
+                color: #fbbf24;
+                background: transparent;
+                margin-top: 16px;
+            """)
+            title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fallback_layout.addWidget(title_label)
+
+            if is_macos_bundle:
+                fallback_message = "Opening in your default browser..."
+            else:
+                fallback_message = "PyQt6-WebEngine not installed.\nOpening in your default browser..."
+
+            message_label = QLabel(fallback_message)
+            message_label.setStyleSheet("""
+                font-size: 14px;
+                color: #71717a;
+                background: transparent;
+                margin-top: 8px;
+            """)
+            message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fallback_layout.addWidget(message_label)
+
+            layout.addWidget(fallback_container)
+
+    def start_server(self) -> bool:
+        """Start the memory viewer Flask server."""
+        if self.is_server_running:
+            debug_log("memory viewer server already running (skipping start)", "desktop")
+            return True
+
+        print("🧠 Starting memory viewer server...", flush=True)
+
+        try:
+            # Check if server is already running on the port
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('localhost', self.MEMORY_VIEWER_PORT))
+            sock.close()
+
+            if result == 0:
+                # Port is already in use, assume server is running
+                self.is_server_running = True
+                print(f"   ✓ Server already running on port {self.MEMORY_VIEWER_PORT}", flush=True)
+                debug_log(f"memory viewer server already running on port {self.MEMORY_VIEWER_PORT}", "desktop")
+                return True
+
+            # Check if we're running as a frozen/bundled app
+            is_frozen = getattr(sys, 'frozen', False)
+            print(f"   → Frozen app: {is_frozen}", flush=True)
+
+            if is_frozen:
+                # Bundled app: run Flask server in a thread
+                try:
+                    from desktop_app.memory_viewer import app as flask_app
+                except Exception as import_err:
+                    debug_log(f"failed to import memory_viewer: {import_err}", "desktop")
+                    return False
+
+                def run_flask_server():
+                    try:
+                        # Suppress Werkzeug's development server warning in bundled apps
+                        import logging
+                        logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+                        # Disable Flask's reloader and debug mode
+                        flask_app.run(
+                            host="127.0.0.1",
+                            port=self.MEMORY_VIEWER_PORT,
+                            debug=False,
+                            use_reloader=False,
+                            threaded=True
+                        )
+                    except Exception as server_err:
+                        debug_log(f"memory viewer server error: {server_err}", "desktop")
+
+                self.server_thread = threading.Thread(target=run_flask_server, daemon=True)
+                self.server_thread.start()
+                debug_log("memory viewer server started in thread (bundled mode)", "desktop")
+
+                # For bundled mode, use simple wait - Flask thread starts quickly
+                # The complex socket polling below is for subprocess mode reliability
+                import time
+                time.sleep(1)
+                self.is_server_running = True
+                return True
+            else:
+                # Development: start server in subprocess
+                python_exe = sys.executable
+
+                # Set up environment with PYTHONPATH for source runs
+                env = os.environ.copy()
+                src_path = Path(__file__).parent.parent  # Go up to src/
+                if "PYTHONPATH" in env:
+                    env["PYTHONPATH"] = f"{src_path}{os.pathsep}{env['PYTHONPATH']}"
+                else:
+                    env["PYTHONPATH"] = str(src_path)
+
+                # Ensure UTF-8 encoding for subprocess (Windows cp1252 can't handle emojis)
+                env["PYTHONIOENCODING"] = "utf-8"
+
+                # Use creationflags to prevent console window popup on Windows
+                creationflags = 0
+                if sys.platform == 'win32':
+                    creationflags = subprocess.CREATE_NO_WINDOW
+
+                print(f"   -> Python: {python_exe}", flush=True)
+                print(f"   -> PYTHONPATH: {env.get('PYTHONPATH', 'not set')}", flush=True)
+
+                self.server_process = subprocess.Popen(
+                    [python_exe, "-m", "desktop_app.memory_viewer"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    env=env,
+                    creationflags=creationflags,
+                )
+                print(f"   → Subprocess PID: {self.server_process.pid}", flush=True)
+                debug_log("memory viewer server started in subprocess (development mode)", "desktop")
+
+            # Wait for server to actually start (with verification)
+            import time
+            import socket
+            max_wait = 5  # seconds
+            start_time = time.time()
+
+            print(f"   → Waiting for server (max {max_wait}s)...", flush=True)
+
+            while time.time() - start_time < max_wait:
+                # Check if subprocess died
+                if self.server_process and self.server_process.poll() is not None:
+                    # Process exited - read any error output
+                    print(f"   ✗ Subprocess exited with code {self.server_process.returncode}", flush=True)
+                    try:
+                        stdout, _ = self.server_process.communicate(timeout=1)
+                        if stdout:
+                            print(f"   → Output:\n{stdout}", flush=True)
+                        debug_log(f"memory viewer subprocess exited: {stdout}", "desktop")
+                    except Exception as e:
+                        print(f"   → Error reading output: {e}", flush=True)
+                    self.server_process = None
+                    return False
+
+                # Check if server is listening
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex(('127.0.0.1', self.MEMORY_VIEWER_PORT))
+                sock.close()
+
+                if result == 0:
+                    self.is_server_running = True
+                    print(f"   ✓ Server running on port {self.MEMORY_VIEWER_PORT}", flush=True)
+                    debug_log(f"memory viewer server confirmed running on port {self.MEMORY_VIEWER_PORT}", "desktop")
+                    return True
+
+                time.sleep(0.2)
+
+            # Timeout - server didn't start
+            print(f"   ✗ Server failed to start within {max_wait}s", flush=True)
+            debug_log(f"memory viewer server failed to start within {max_wait}s", "desktop")
+            if self.server_process:
+                # Try to get any output
+                try:
+                    poll_result = self.server_process.poll()
+                    print(f"   → Process poll result: {poll_result}", flush=True)
+                    self.server_process.terminate()
+                    stdout, _ = self.server_process.communicate(timeout=2)
+                    if stdout:
+                        print(f"   → Server output:\n{stdout}", flush=True)
+                        debug_log(f"memory viewer subprocess output: {stdout}", "desktop")
+                    else:
+                        print("   → No output from server process", flush=True)
+                except Exception as e:
+                    print(f"   → Error getting output: {e}", flush=True)
+                self.server_process = None
+            return False
+
+        except Exception as e:
+            print(f"   ✗ Exception starting server: {e}", flush=True)
+            debug_log(f"failed to start memory viewer server: {e}", "desktop")
+            return False
+
+    def stop_server(self) -> None:
+        """Stop the memory viewer Flask server."""
+        if self.server_process:
+            try:
+                self.server_process.terminate()
+                self.server_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.server_process.kill()
+                self.server_process.wait()
+            except Exception as e:
+                debug_log(f"error stopping memory viewer server: {e}", "desktop")
+            finally:
+                self.server_process = None
+                self.is_server_running = False
+
+        # Thread-based server (bundled mode) will stop when app exits (daemon thread)
+        if self.server_thread:
+            self.server_thread = None
+            self.is_server_running = False
+
+    def _show_error_page(self, message: str) -> None:
+        """Show an error page in the web view."""
+        if self.web_view:
+            error_html = f"""
+            <html>
+            <head><style>
+                body {{ background: #18181b; color: #e4e4e7; font-family: system-ui;
+                       display: flex; justify-content: center; align-items: center;
+                       height: 100vh; margin: 0; }}
+                .error {{ text-align: center; padding: 40px; }}
+                .icon {{ font-size: 64px; margin-bottom: 20px; }}
+                h1 {{ color: #fbbf24; margin-bottom: 16px; }}
+                p {{ color: #71717a; max-width: 400px; line-height: 1.6; }}
+            </style></head>
+            <body><div class="error">
+                <div class="icon">⚠️</div>
+                <h1>Connection Failed</h1>
+                <p>{message}</p>
+            </div></body>
+            </html>
+            """
+            self.web_view.setHtml(error_html)
+
+    def showEvent(self, event) -> None:
+        """Called when window is shown."""
+        super().showEvent(event)
+
+        try:
+            # Start server when window opens
+            if self.start_server():
+                if self.web_view:
+                    # Set URL and load (URL is set here, not in __init__, to avoid WebEngine crash)
+                    self.web_view.setUrl(QUrl(f"http://localhost:{self.MEMORY_VIEWER_PORT}"))
+                else:
+                    # Open in system browser as fallback
+                    import webbrowser
+                    webbrowser.open(f"http://localhost:{self.MEMORY_VIEWER_PORT}")
+            else:
+                # Server failed to start - show error message
+                debug_log("memory viewer server failed to start", "desktop")
+                self._show_error_page(
+                    "The memory viewer server failed to start. "
+                    "Check the console output for details."
+                )
+        except Exception as e:
+            debug_log(f"error in memory viewer showEvent: {e}", "desktop")
+            self._show_error_page(f"Error: {e}")
+
+    def closeEvent(self, event) -> None:
+        """Called when window is closed."""
+        # Don't stop the server on close - just hide the window
+        # Server will be stopped on app quit
+        event.accept()
+
+
+class JarvisSystemTray:
+    """System tray application for Jarvis voice assistant."""
+
+    def __init__(self):
+        # Use existing QApplication if available, otherwise create one
+        self.app = QApplication.instance()
+        if self.app is None:
+            self.app = QApplication(sys.argv)
+        self.app.setQuitOnLastWindowClosed(False)
+
+        # Initialize state
+        self.daemon_process: Optional[subprocess.Popen] = None
+        self.daemon_thread: Optional[QThread] = None
+        self.is_listening = False
+        self.is_bundled = getattr(sys, 'frozen', False)
+
+        # Kill any orphaned Jarvis processes from previous sessions
+        self.cleanup_orphaned_processes()
+
+        # Create log viewer window (hidden by default)
+        self.log_viewer = LogViewerWindow()
+        self.log_signals = LogSignals()
+        self.log_signals.new_log.connect(self.log_viewer.append_log)
+
+        # Create memory viewer window (hidden by default)
+        self.memory_viewer = MemoryViewerWindow()
+
+        # Create face window (hidden by default)
+        # Note: Creating the face window also initializes the SpeakingState singleton
+        # in the main thread, which is important for cross-thread signal delivery
+        self.face_window = FaceWindow()
+
+        # Create dictation history window (hidden by default)
+        from desktop_app.dictation_history import DictationHistoryWindow
+        from jarvis.dictation.history import DictationHistory
+        self._dictation_history = DictationHistory()
+        self.dictation_history_window = DictationHistoryWindow(history=self._dictation_history)
+
+        # Log reader threads
+        self.log_reader_threads = []
+
+        # Create system tray icon
+        self.tray_icon = QSystemTrayIcon()
+        self.update_icon()
+
+        # Create context menu
+        self.create_menu()
+
+        # Set up status checking timer
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.check_daemon_status)
+        self.status_timer.start(2000)  # Check every 2 seconds
+
+        # Show tray icon
+        self.tray_icon.show()
+
+        # Register cleanup on app exit
+        self.app.aboutToQuit.connect(self.cleanup_on_exit)
+
+        # Check for updates on startup (delayed by 5 seconds to not block app startup)
+        QTimer.singleShot(5000, self.check_for_updates)
+
+        debug_log("desktop app initialized", "desktop")
+
+    def cleanup_orphaned_processes(self) -> None:
+        """Kill any orphaned Jarvis daemon processes from previous sessions."""
+        try:
+            current_pid = os.getpid()
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    cmdline = proc.info.get('cmdline', [])
+                    if cmdline and 'jarvis.main' in ' '.join(cmdline):
+                        # This is a Jarvis daemon process
+                        if proc.pid != current_pid:
+                            debug_log(f"killing orphaned jarvis process: {proc.pid}", "desktop")
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=2)
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception as e:
+            debug_log(f"error cleaning up orphaned processes: {e}", "desktop")
+
+    def cleanup_on_exit(self) -> None:
+        """Cleanup when app is exiting."""
+        debug_log("cleaning up on exit", "desktop")
+        if self.is_listening:
+            self.stop_daemon()
+        # Stop memory viewer server
+        if hasattr(self, 'memory_viewer'):
+            self.memory_viewer.stop_server()
+        # Safety net: if daemon process exists but is_listening was False, still clean up
+        # (This shouldn't happen in normal operation, but handles edge cases)
+        if self.daemon_process:
+            try:
+                self.daemon_process.terminate()
+                try:
+                    # Use longer timeout to allow diary update to complete
+                    self.daemon_process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    self.daemon_process.kill()
+                    self.daemon_process.wait()
+            except Exception as e:
+                debug_log(f"error during exit cleanup: {e}", "desktop")
+
+    def create_menu(self) -> None:
+        """Create the system tray context menu."""
+        self.menu = QMenu()
+
+        # Toggle listening action
+        self.toggle_action = QAction("▶️ Start Listening")
+        self.toggle_action.triggered.connect(self.toggle_listening)
+        self.menu.addAction(self.toggle_action)
+
+        self.menu.addSeparator()
+
+        # View logs action
+        self.logs_action = QAction("📝 View Logs")
+        self.logs_action.triggered.connect(self.show_log_viewer)
+        self.menu.addAction(self.logs_action)
+
+        # Memory viewer action
+        self.memory_action = QAction("🧠 Memory Viewer")
+        self.memory_action.triggered.connect(self.show_memory_viewer)
+        self.menu.addAction(self.memory_action)
+
+        # Dictation history action
+        self.dictation_history_action = QAction("🎙️ Dictation History")
+        self.dictation_history_action.triggered.connect(self.show_dictation_history)
+        self.menu.addAction(self.dictation_history_action)
+
+        # Face window action
+        self.face_action = QAction("👤 Show Face")
+        self.face_action.triggered.connect(self.show_face_window)
+        self.menu.addAction(self.face_action)
+
+        # Setup wizard action
+        self.setup_wizard_action = QAction("🔧 Setup Wizard")
+        self.setup_wizard_action.triggered.connect(self.show_setup_wizard)
+        self.menu.addAction(self.setup_wizard_action)
+
+        # Settings action
+        self.settings_action = QAction("⚙️ Settings")
+        self.settings_action.triggered.connect(self.show_settings)
+        self.menu.addAction(self.settings_action)
+
+        # Check for updates action
+        self.check_updates_action = QAction("🔄 Check for Updates")
+        self.check_updates_action.triggered.connect(lambda: self.check_for_updates(show_no_update_dialog=True))
+        self.menu.addAction(self.check_updates_action)
+
+        # Reinstall GPU libraries (Windows + NVIDIA only). Only added when
+        # the bundled install script is present and an NVIDIA driver was
+        # detected; otherwise the action would be a dead button.
+        self._maybe_add_cuda_recovery_action()
+
+        self.menu.addSeparator()
+
+        # Open directories actions
+        self.open_config_action = QAction("📁 Open Config Directory")
+        self.open_config_action.triggered.connect(self.open_config_directory)
+        self.menu.addAction(self.open_config_action)
+
+        self.open_data_action = QAction("💾 Open Data Directory")
+        self.open_data_action.triggered.connect(self.open_data_directory)
+        self.menu.addAction(self.open_data_action)
+
+        self.menu.addSeparator()
+
+        # Status action (non-clickable)
+        self.status_action = QAction("⚪ Status: Stopped")
+        self.status_action.setEnabled(False)
+        self.menu.addAction(self.status_action)
+
+        self.menu.addSeparator()
+
+        # Quit action
+        self.quit_action = QAction("🚪 Quit")
+        self.quit_action.triggered.connect(self.quit_app)
+        self.menu.addAction(self.quit_action)
+
+        self.tray_icon.setContextMenu(self.menu)
+
+    def _maybe_add_cuda_recovery_action(self) -> None:
+        """Add the GPU-libraries reinstall action to the tray menu, when applicable."""
+        try:
+            from desktop_app.cuda_recovery import cuda_recovery_action
+        except Exception as e:
+            debug_log(f"cuda recovery import failed: {e}", "desktop")
+            return
+
+        # In bundled mode the script lives next to the executable; in dev
+        # runs it lives at installer/windows/install_cuda.ps1.
+        if getattr(sys, "frozen", False):
+            install_root = Path(sys.executable).parent
+        else:
+            install_root = Path(__file__).resolve().parents[2] / "installer" / "windows"
+
+        action_spec = cuda_recovery_action(install_root=install_root)
+        if action_spec is None:
+            return
+
+        self.cuda_recovery_action = QAction(action_spec.label)
+        self.cuda_recovery_action.triggered.connect(
+            lambda: self._run_cuda_recovery(action_spec)
+        )
+        self.menu.addAction(self.cuda_recovery_action)
+
+    def _run_cuda_recovery(self, action_spec: "CudaRecoveryAction") -> None:
+        """Confirm with the user, then launch the recovery script with UAC."""
+        from desktop_app.cuda_recovery import run_action
+        from PyQt6.QtWidgets import QMessageBox
+
+        reply = QMessageBox.question(
+            None,
+            "Reinstall GPU libraries",
+            (
+                "This will download cuBLAS and cuDNN (~1.1 GB) and install them "
+                "into the Jarvis program folder. You'll see a UAC prompt. "
+                "Continue?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        ok = run_action(action_spec)
+        if not ok:
+            QMessageBox.warning(
+                None,
+                "Reinstall GPU libraries",
+                (
+                    "Could not launch the installer. If you dismissed the UAC "
+                    f"prompt, try again. See the log at\n{action_spec.target_dir / 'install.log'}"
+                ),
+            )
+            return
+
+        QMessageBox.information(
+            None,
+            "Reinstall GPU libraries",
+            (
+                "The CUDA installer is running. Once it finishes, restart "
+                f"Jarvis to use GPU acceleration. See {action_spec.target_dir / 'install.log'} "
+                "for details."
+            ),
+        )
+
+    def show_setup_wizard(self) -> None:
+        """Show the setup wizard window."""
+        from desktop_app.setup_wizard import SetupWizard
+        from PyQt6.QtWidgets import QWizard
+
+        # Remember if daemon was running before wizard
+        was_listening = self.is_listening
+
+        # Stop daemon while setup wizard is open (to allow changes to take effect)
+        if was_listening:
+            self.stop_daemon()
+
+        # Face should look asleep while wizard is open (daemon isn't running)
+        try:
+            from desktop_app.face_widget import JarvisState, get_jarvis_state
+            get_jarvis_state().set_state(JarvisState.ASLEEP)
+        except Exception:
+            pass
+
+        wizard = SetupWizard()
+        result = wizard.exec()
+
+        # Restart daemon after wizard completes (finished or cancelled)
+        # This ensures any config changes (model selection, etc.) are applied
+        # For first-time users: daemon wasn't running, so we start it
+        # For existing users: restart to apply changes
+        if result == QWizard.DialogCode.Accepted or was_listening:
+            self.start_daemon()
+
+    def show_settings(self) -> None:
+        """Show the settings window."""
+        from desktop_app.settings_window import SettingsWindow
+        from PyQt6.QtWidgets import QMessageBox
+
+        dialog = SettingsWindow()
+        result = dialog.exec()
+
+        # If settings were saved and daemon is running, offer to restart
+        if result == QDialog.DialogCode.Accepted and self.is_listening:
+            reply = QMessageBox.question(
+                None, "🔄 Restart?",
+                "Settings saved. Restart Jarvis now to apply changes?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.stop_daemon()
+                self.start_daemon()
+
+    def check_for_updates(self, show_no_update_dialog: bool = False) -> None:
+        """Check for available updates.
+
+        Args:
+            show_no_update_dialog: If True, shows a dialog even when no update is available.
+        """
+        from desktop_app.updater import check_for_updates, is_frozen
+        from desktop_app.update_dialog import (
+            UpdateAvailableDialog,
+            UpdateProgressDialog,
+            show_no_update_dialog as show_no_update,
+            show_update_error_dialog,
+        )
+
+        # Only check for updates if running as bundled app
+        if not is_frozen():
+            if show_no_update_dialog:
+                from PyQt6.QtWidgets import QMessageBox
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Icon.Information)
+                msg.setWindowTitle("Updates")
+                msg.setText("Auto-update is only available in the bundled desktop app.")
+                msg.setInformativeText("You're running from source. Use git pull to update.")
+                msg.setStyleSheet(JARVIS_THEME_STYLESHEET)
+                msg.exec()
+            return
+
+        try:
+            status = check_for_updates()
+
+            if status.error:
+                debug_log(f"Update check failed: {status.error}", "desktop")
+                if show_no_update_dialog:
+                    show_update_error_dialog(status.error)
+                return
+
+            if status.update_available and status.latest_release:
+                # Show update available dialog
+                dialog = UpdateAvailableDialog(status)
+                if dialog.exec() == QDialog.DialogCode.Accepted:
+                    # User chose to update - create callback to save diary before install
+                    def save_session_before_update():
+                        """Stop daemon and save diary before update installation."""
+                        if self.is_listening:
+                            debug_log("Saving session before update...", "updater")
+                            self.stop_daemon(show_diary_dialog=True)
+
+                    progress_dialog = UpdateProgressDialog(
+                        status.latest_release,
+                        pre_install_callback=save_session_before_update,
+                    )
+                    progress_dialog.show()
+                    progress_dialog.start_download()
+
+                    result = progress_dialog.exec()
+                    if result == QDialog.DialogCode.Accepted:
+                        # Update successful, exit app (diary already saved via pre_install_callback)
+                        self.quit_app(skip_diary=True)
+            elif show_no_update_dialog:
+                show_no_update(status.current_version)
+
+        except Exception as e:
+            debug_log(f"Update check error: {e}", "desktop")
+            if show_no_update_dialog:
+                show_update_error_dialog(str(e))
+
+    def show_log_viewer(self) -> None:
+        """Show the log viewer window and bring it to front."""
+        self.log_viewer.show()
+        self.log_viewer.raise_()
+        self.log_viewer.activateWindow()
+
+    def show_memory_viewer(self) -> None:
+        """Show the memory viewer window and bring it to front."""
+        self.memory_viewer.show()
+        self.memory_viewer.raise_()
+        self.memory_viewer.activateWindow()
+
+    def show_dictation_history(self) -> None:
+        """Show the dictation history window and bring it to front."""
+        self.dictation_history_window.show()
+        self.dictation_history_window.raise_()
+        self.dictation_history_window.activateWindow()
+
+    def _connect_dictation_history(self, retries_left: int = 3) -> None:
+        """Wire dictation engine's result callback to the history window signal.
+
+        Called once after daemon startup so live entries appear immediately.
+        Retries up to *retries_left* times (5 s apart) if the engine isn't ready.
+        """
+        try:
+            from jarvis.daemon import get_dictation_engine
+            engine = get_dictation_engine()
+            if engine is None:
+                if retries_left > 0:
+                    QTimer.singleShot(
+                        5000,
+                        lambda: self._connect_dictation_history(retries_left - 1),
+                    )
+                else:
+                    debug_log("dictation engine never became available", "desktop")
+                return
+            # Share the same DictationHistory instance
+            engine.history = self._dictation_history
+            # Route new-entry notifications through the Qt signal
+            engine.set_on_dictation_result(
+                lambda entry: self.dictation_history_window.signals.new_entry.emit(entry)
+            )
+            debug_log("dictation history connected to UI", "desktop")
+        except Exception as e:
+            debug_log(f"failed to connect dictation history: {e}", "desktop")
+
+    def show_face_window(self) -> None:
+        """Show the face window and bring it to front."""
+        self.face_window.show()
+        self.face_window.raise_()
+        self.face_window.activateWindow()
+
+    def open_directory(self, directory_path: Path, directory_name: str) -> None:
+        """Open a directory in the system file manager."""
+        try:
+            # Ensure directory exists
+            directory_path.mkdir(parents=True, exist_ok=True)
+
+            # Open directory based on platform
+            if sys.platform == "darwin":  # macOS
+                subprocess.Popen(["open", str(directory_path)])
+            elif sys.platform == "win32":  # Windows
+                os.startfile(str(directory_path))
+            else:  # Linux and other Unix-like systems
+                subprocess.Popen(["xdg-open", str(directory_path)])
+
+            debug_log(f"opened {directory_name} directory: {directory_path}", "desktop")
+            self.log_signals.new_log.emit(f"📂 Opened {directory_name} directory\n")
+        except Exception as e:
+            debug_log(f"failed to open {directory_name} directory: {e}", "desktop")
+            self.log_signals.new_log.emit(f"❌ Failed to open {directory_name} directory: {str(e)}\n")
+            self.tray_icon.showMessage(
+                f"Error Opening {directory_name} Directory",
+                f"Failed to open directory: {str(e)}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                3000
+            )
+
+    def open_config_directory(self) -> None:
+        """Open the configuration directory in the system file manager."""
+        config_path = default_config_path()
+        config_dir = config_path.parent
+        self.open_directory(config_dir, "Config")
+
+    def open_data_directory(self) -> None:
+        """Open the data directory (where database is stored) in the system file manager."""
+        db_path = Path(_default_db_path())
+        data_dir = db_path.parent
+        self.open_directory(data_dir, "Data")
+
+    def get_icon_path(self, icon_name: str) -> Path:
+        """Get the path to an icon file."""
+        # Try to find icons in the package directory
+        package_dir = Path(__file__).parent
+        icons_dir = package_dir / "desktop_assets"
+        icon_path = icons_dir / icon_name
+
+        if icon_path.exists():
+            return icon_path
+
+        # Fallback: return a simple colored icon
+        return icon_path
+
+    def update_icon(self) -> None:
+        """Update the tray icon based on current state."""
+        if self.is_listening:
+            icon_name = "icon_listening.png"
+        else:
+            icon_name = "icon_idle.png"
+
+        icon_path = self.get_icon_path(icon_name)
+
+        # If icon file doesn't exist, use a default from system
+        if icon_path.exists():
+            icon = QIcon(str(icon_path))
+        else:
+            # Use a simple text-based icon as fallback
+            from PyQt6.QtGui import QPixmap, QPainter, QColor, QFont
+            pixmap = QPixmap(64, 64)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+
+            # Draw a circle
+            color = QColor("#4CAF50" if self.is_listening else "#9E9E9E")
+            painter.setBrush(color)
+            painter.setPen(color)
+            painter.drawEllipse(4, 4, 56, 56)
+
+            # Draw letter J
+            painter.setPen(Qt.GlobalColor.white)
+            font = QFont("Arial", 32, QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "J")
+
+            painter.end()
+            icon = QIcon(pixmap)
+
+        self.tray_icon.setIcon(icon)
+
+    def toggle_listening(self) -> None:
+        """Toggle the Jarvis daemon on/off."""
+        if self.is_listening:
+            self.stop_daemon()
+        else:
+            self.start_daemon()
+
+    def start_daemon(self) -> None:
+        """Start the Jarvis daemon."""
+        try:
+            if self.is_bundled:
+                # When bundled, run daemon in a QThread since Qt components may be used
+
+                class DaemonThread(QThread):
+                    """QThread to run the daemon."""
+                    def __init__(self, log_signals):
+                        super().__init__()
+                        self.log_signals = log_signals
+
+                    def run(self):
+                        """Run the daemon in this QThread."""
+                        import sys as sys_module
+                        old_stdout = sys_module.stdout
+                        old_stderr = sys_module.stderr
+
+                        try:
+                            # Redirect stdout/stderr to capture logs
+                            class LogWriter:
+                                def __init__(self, emit_func):
+                                    self.emit_func = emit_func
+                                    self.buffer = ""
+
+                                def write(self, text):
+                                    if text:
+                                        # Handle both bytes and str (Flask can send bytes)
+                                        if isinstance(text, bytes):
+                                            text = text.decode('utf-8', errors='replace')
+                                        self.buffer += text
+                                        if '\n' in self.buffer:
+                                            lines = self.buffer.split('\n')
+                                            self.buffer = lines[-1]
+                                            for line in lines[:-1]:
+                                                if line.strip():
+                                                    self.emit_func(line + '\n')
+
+                                def flush(self):
+                                    if self.buffer.strip():
+                                        self.emit_func(self.buffer)
+                                        self.buffer = ""
+
+                            log_writer = LogWriter(self.log_signals.new_log.emit)
+                            sys_module.stdout = log_writer
+                            sys_module.stderr = log_writer
+
+                            try:
+                                # Import and run the daemon
+                                from jarvis.daemon import main as daemon_main
+                                self.log_signals.new_log.emit("🚀 Jarvis daemon started\n")
+                                self.log_signals.new_log.emit("📋 Initializing daemon components...\n")
+
+                                # Run daemon - this should run the main loop
+                                daemon_main()
+
+                                from jarvis.daemon import is_stop_requested
+                                if is_stop_requested():
+                                    self.log_signals.new_log.emit("✅ Daemon stopped gracefully\n")
+                                else:
+                                    self.log_signals.new_log.emit("⚠️ Daemon exited unexpectedly\n")
+                            except KeyboardInterrupt:
+                                self.log_signals.new_log.emit("⏸️ Daemon interrupted\n")
+                            except Exception as e:
+                                error_msg = f"❌ Daemon runtime error: {str(e)}\n{traceback.format_exc()}\n"
+                                self.log_signals.new_log.emit(error_msg)
+                                # Also try to log via debug_log (though it might not work)
+                                try:
+                                    debug_log(f"daemon thread error: {e}", "desktop")
+                                except Exception:
+                                    pass
+                            finally:
+                                sys_module.stdout = old_stdout
+                                sys_module.stderr = old_stderr
+                        except Exception as e:
+                            # Outer exception handler for setup errors
+                            error_msg = f"❌ Daemon setup error: {str(e)}\n{traceback.format_exc()}\n"
+                            try:
+                                self.log_signals.new_log.emit(error_msg)
+                            except Exception:
+                                # If we can't emit, at least try stdout
+                                print(error_msg, file=old_stderr)
+
+                self.daemon_thread = DaemonThread(self.log_signals)
+                # Connect finished signal to reset UI state
+                self.daemon_thread.finished.connect(lambda: self._on_daemon_finished())
+                self.daemon_thread.start()
+
+                # Connect dictation engine to history window once daemon is ready
+                QTimer.singleShot(3000, self._connect_dictation_history)
+            else:
+                # When not bundled, use subprocess as before
+                python_exe = sys.executable
+
+                # Set up environment with PYTHONPATH for source runs
+                env = os.environ.copy()
+                src_path = Path(__file__).parent.parent  # Go up to src/
+                if "PYTHONPATH" in env:
+                    env["PYTHONPATH"] = f"{src_path}{os.pathsep}{env['PYTHONPATH']}"
+                else:
+                    env["PYTHONPATH"] = str(src_path)
+
+                # Use creationflags to prevent console window popup on Windows
+                # CREATE_NEW_PROCESS_GROUP is needed for CTRL_BREAK_EVENT to work
+                creationflags = 0
+                if sys.platform == 'win32':
+                    creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+
+                self.daemon_process = subprocess.Popen(
+                    [python_exe, "-m", "jarvis.main"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    bufsize=1,
+                    env=env,
+                    creationflags=creationflags,
+                )
+
+                # Start log reader thread
+                log_thread = threading.Thread(
+                    target=self._read_daemon_logs,
+                    daemon=True
+                )
+                log_thread.start()
+                self.log_reader_threads.append(log_thread)
+                self.log_signals.new_log.emit("🚀 Jarvis daemon started\n")
+
+            self.is_listening = True
+            self.toggle_action.setText("⏸️ Stop Listening")
+            self.status_action.setText("🟢 Status: Listening")
+            self.update_icon()
+
+            # Show log viewer when starting listening
+            self.log_viewer.show()
+            self.log_viewer.raise_()
+            self.log_viewer.activateWindow()
+
+            self.tray_icon.showMessage(
+                "Jarvis Started",
+                "Voice assistant is now listening",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000
+            )
+
+            # Show face window when starting
+            self.face_window.show()
+            self.face_window.raise_()
+
+            debug_log("daemon started from desktop app", "desktop")
+
+        except Exception as e:
+            debug_log(f"failed to start daemon: {e}", "desktop")
+            self.log_signals.new_log.emit(f"❌ Failed to start: {str(e)}\n{traceback.format_exc()}\n")
+            self.tray_icon.showMessage(
+                "Error Starting Jarvis",
+                f"Failed to start: {str(e)}",
+                QSystemTrayIcon.MessageIcon.Critical,
+                3000
+            )
+
+    def _on_daemon_finished(self) -> None:
+        """Called when daemon thread finishes."""
+        if self.is_listening:
+            self.is_listening = False
+            self.toggle_action.setText("▶️ Start Listening")
+            self.status_action.setText("⚪ Status: Stopped")
+            self.update_icon()
+            self.daemon_thread = None
+            # Reset face to asleep so it doesn't look ready while daemon is down
+            try:
+                from desktop_app.face_widget import JarvisState, get_jarvis_state
+                get_jarvis_state().set_state(JarvisState.ASLEEP)
+            except Exception:
+                pass
+
+    def _read_daemon_logs(self) -> None:
+        """Read logs from daemon subprocess in a background thread."""
+        if not self.daemon_process or not self.daemon_process.stdout:
+            return
+
+        try:
+            while True:
+                line = self.daemon_process.stdout.readline()
+                if not line:
+                    # EOF - process has ended
+                    debug_log("log reader: EOF reached, daemon stdout closed", "desktop")
+                    break
+                # Debug: log IPC events specifically
+                if "__DIARY__:" in line:
+                    debug_log(f"log reader: IPC event read: {line[:80]}...", "desktop")
+                self.log_signals.new_log.emit(line)
+        except Exception as e:
+            debug_log(f"log reader error: {e}", "desktop")
+            self.log_signals.new_log.emit(f"⚠️ Log reader error: {e}\n")
+
+    def stop_daemon(self, show_diary_dialog: bool = True) -> None:
+        """Stop the Jarvis daemon.
+
+        Args:
+            show_diary_dialog: If True (and bundled), shows a dialog with live diary update progress.
+        """
+        # Timeout must be longer than SHUTDOWN_DIARY_TIMEOUT_SEC (45s) in daemon.py
+        # to allow the diary update LLM call to complete before force-killing
+        shutdown_wait_timeout_sec = 60
+        diary_dialog = None
+
+        debug_log(f"stop_daemon called: is_bundled={self.is_bundled}, daemon_thread={self.daemon_thread}, show_diary_dialog={show_diary_dialog}", "desktop")
+
+        try:
+            if self.is_bundled and self.daemon_thread:
+                # When running in a QThread, use the stop flag for graceful shutdown
+                # This ensures the daemon's finally block runs (for diary update)
+                self.log_signals.new_log.emit("⏸️ Stopping Jarvis daemon...\n")
+
+                # Show diary update dialog for bundled app
+                if show_diary_dialog:
+                    diary_dialog = DiaryUpdateDialog()
+
+                    # Set up thread-safe callbacks that emit Qt signals
+                    # These callbacks run in the daemon thread, so we use signals
+                    def on_token(token: str):
+                        diary_dialog.signals.token_received.emit(token)
+
+                    def on_status(status: str):
+                        diary_dialog.signals.status_changed.emit(status)
+
+                    def on_chunks(chunks: list):
+                        # Use signal for thread-safe cross-thread communication
+                        diary_dialog.signals.chunks_received.emit(chunks)
+
+                    def on_complete(success: bool):
+                        diary_dialog.signals.completed.emit(success)
+
+                    # Set callbacks in daemon before requesting stop
+                    from jarvis.daemon import set_diary_update_callbacks, request_stop
+                    set_diary_update_callbacks(
+                        on_token=on_token,
+                        on_status=on_status,
+                        on_chunks=on_chunks,
+                        on_complete=on_complete,
+                    )
+
+                    # Hide other windows while showing diary dialog
+                    if hasattr(self, 'face_window') and self.face_window and self.face_window.isVisible():
+                        self.face_window.hide()
+                    if hasattr(self, 'log_viewer') and self.log_viewer.isVisible():
+                        self.log_viewer.hide()
+
+                    # Show dialog (non-modal so we can process events)
+                    diary_dialog.show()
+                    diary_dialog.raise_()
+                    diary_dialog.activateWindow()
+                    self.app.processEvents()
+
+                    # Request graceful stop
+                    request_stop()
+
+                    # Process events while waiting for thread to finish
+                    # Note: We avoid QThread.terminate() as it can corrupt state
+                    # If the daemon doesn't stop gracefully, it will be killed on process exit
+                    start_time = time.time()
+                    warned = False
+                    while not self.daemon_thread.isFinished():
+                        self.app.processEvents()
+                        elapsed = time.time() - start_time
+                        if elapsed > shutdown_wait_timeout_sec and not warned:
+                            self.log_signals.new_log.emit("⚠️ Daemon taking longer than expected...\n")
+                            debug_log("daemon thread not responding to stop request", "desktop")
+                            warned = True
+                        # Keep waiting up to 3x the timeout before giving up
+                        if elapsed > shutdown_wait_timeout_sec * 3:
+                            self.log_signals.new_log.emit("⚠️ Giving up waiting for daemon\n")
+                            break
+                        time.sleep(0.05)
+
+                    # Brief delay to show completion state
+                    self.app.processEvents()
+                    time.sleep(0.5)
+
+                    # Close dialog
+                    diary_dialog.close()
+
+                    # Clear callbacks
+                    set_diary_update_callbacks()
+                else:
+                    # No dialog - simple wait
+                    # Note: We avoid QThread.terminate() as it can corrupt state
+                    from jarvis.daemon import request_stop
+                    request_stop()
+
+                    if not self.daemon_thread.wait(shutdown_wait_timeout_sec * 1000):
+                        self.log_signals.new_log.emit("⚠️ Daemon taking longer than expected...\n")
+                        debug_log("daemon thread not responding to stop request", "desktop")
+                        # Wait up to 3x timeout total before giving up
+                        self.daemon_thread.wait(shutdown_wait_timeout_sec * 2000)
+
+                self.daemon_thread = None
+            elif self.daemon_process:
+                # For subprocess mode, show diary dialog with IPC-based updates
+                # The existing log reader thread emits signals; we use a queue to collect lines
+                # and process them in the main loop to avoid cross-thread Qt signal issues
+                from desktop_app.diary_dialog import DIARY_IPC_PREFIX
+                import queue
+
+                log_queue = queue.Queue()
+                ipc_received = False
+
+                # Connect to log signals and put lines into queue for main loop processing
+                def queue_log_line(line: str):
+                    log_queue.put(line)
+
+                log_connection = self.log_signals.new_log.connect(queue_log_line)
+
+                if show_diary_dialog:
+                    diary_dialog = DiaryUpdateDialog()
+                    diary_dialog.set_status("Shutting down...")
+                    diary_dialog.show()
+                    diary_dialog.raise_()
+                    diary_dialog.activateWindow()
+                    self.app.processEvents()
+
+                    # Hide other windows
+                    if hasattr(self, 'face_window') and self.face_window and self.face_window.isVisible():
+                        self.face_window.hide()
+                    if hasattr(self, 'log_viewer') and self.log_viewer.isVisible():
+                        self.log_viewer.hide()
+
+                # Send signal for graceful shutdown
+                if sys.platform == "win32":
+                    # On Windows, signals don't work reliably with CREATE_NO_WINDOW
+                    # Close stdin to trigger graceful shutdown in daemon
+                    try:
+                        if self.daemon_process.stdin:
+                            self.daemon_process.stdin.close()
+                    except Exception:
+                        pass
+                    # Also try signal as backup
+                    try:
+                        self.daemon_process.send_signal(signal.CTRL_BREAK_EVENT)
+                    except Exception:
+                        pass
+                else:
+                    self.daemon_process.send_signal(signal.SIGINT)
+
+                # Wait for process to terminate while processing queued log lines
+                start_time = time.time()
+                last_status_update = 0
+
+                while True:
+                    # Process Qt events to receive signals from log reader thread
+                    self.app.processEvents()
+                    elapsed = time.time() - start_time
+
+                    # Process all available log lines from queue
+                    lines_processed = 0
+                    while True:
+                        try:
+                            line = log_queue.get_nowait()
+                            lines_processed += 1
+                            # Process IPC events for diary dialog
+                            if diary_dialog and DIARY_IPC_PREFIX in line:
+                                debug_log(f"IPC event found: {line[:80]}", "desktop")
+                                if diary_dialog.process_log_line(line):
+                                    ipc_received = True
+                        except queue.Empty:
+                            break
+
+                    # Check if process has exited
+                    if self.daemon_process.poll() is not None:
+                        # Process exited - drain remaining queue items
+                        self.app.processEvents()
+                        time.sleep(0.1)  # Brief wait for any final signals
+                        self.app.processEvents()
+                        while True:
+                            try:
+                                line = log_queue.get_nowait()
+                                if diary_dialog and DIARY_IPC_PREFIX in line:
+                                    if diary_dialog.process_log_line(line):
+                                        ipc_received = True
+                            except queue.Empty:
+                                break
+                        break
+
+                    # Update status periodically if no IPC events received
+                    if diary_dialog and not ipc_received and int(elapsed) > last_status_update:
+                        last_status_update = int(elapsed)
+                        if elapsed < 10:
+                            diary_dialog.set_status("Saving diary...")
+                        elif elapsed < 30:
+                            diary_dialog.set_status("Still saving... (AI is thinking)")
+                        else:
+                            diary_dialog.set_status(f"Taking longer than expected ({int(elapsed)}s)...")
+
+                    # Check timeout
+                    if elapsed > shutdown_wait_timeout_sec:
+                        debug_log("subprocess shutdown timeout - killing process", "desktop")
+                        self.daemon_process.kill()
+                        self.daemon_process.wait()
+                        break
+
+                    time.sleep(0.02)
+
+                # Disconnect queue handler
+                try:
+                    self.log_signals.new_log.disconnect(queue_log_line)
+                except Exception:
+                    pass
+
+                # Close diary dialog
+                if diary_dialog:
+                    # If no IPC events received (older daemon?), mark complete manually
+                    if not ipc_received:
+                        diary_dialog.mark_completed(True)
+                    self.app.processEvents()
+                    time.sleep(0.5)
+                    diary_dialog.close()
+
+                self.daemon_process = None
+
+            self.is_listening = False
+            self.toggle_action.setText("▶️ Start Listening")
+            self.status_action.setText("⚪ Status: Stopped")
+            self.update_icon()
+
+            self.tray_icon.showMessage(
+                "Jarvis Stopped",
+                "Voice assistant is no longer listening",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000
+            )
+
+            self.log_signals.new_log.emit("⏸️ Jarvis daemon stopped\n")
+            debug_log("daemon stopped from desktop app", "desktop")
+
+        except Exception as e:
+            debug_log(f"failed to stop daemon: {e}", "desktop")
+            self.log_signals.new_log.emit(f"❌ Failed to stop: {str(e)}\n")
+        finally:
+            # Ensure dialog is closed
+            if diary_dialog:
+                diary_dialog.close()
+
+    def check_daemon_status(self) -> None:
+        """Check if the daemon process/thread is still running."""
+        if self.is_bundled and self.daemon_thread:
+            # Check if QThread is still running
+            if self.daemon_thread.isFinished() and self.is_listening:
+                # Thread has terminated
+                self._on_daemon_finished()
+                self.tray_icon.showMessage(
+                    "Jarvis Stopped",
+                    "Voice assistant process ended unexpectedly",
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    3000
+                )
+                debug_log("daemon thread ended unexpectedly", "desktop")
+        elif self.daemon_process:
+            # Check if process is still alive
+            poll = self.daemon_process.poll()
+            if poll is not None:
+                # Process has terminated
+                self.daemon_process = None
+                if self.is_listening:
+                    self.is_listening = False
+                    self.toggle_action.setText("▶️ Start Listening")
+                    self.status_action.setText("⚪ Status: Stopped")
+                    self.update_icon()
+
+                    self.tray_icon.showMessage(
+                        "Jarvis Stopped",
+                        "Voice assistant process ended unexpectedly",
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        3000
+                    )
+
+                    debug_log("daemon process ended unexpectedly", "desktop")
+
+    def quit_app(self, skip_diary: bool = False) -> None:
+        """Quit the desktop app.
+
+        Args:
+            skip_diary: If True, skips the diary dialog during shutdown.
+                       Used when quitting for an update to allow faster exit.
+        """
+        # Stop daemon if running
+        if self.is_listening:
+            self.stop_daemon(show_diary_dialog=not skip_diary)
+
+        debug_log("desktop app shutting down", "desktop")
+        self.tray_icon.hide()
+        self.app.quit()
+
+    def run(self) -> int:
+        """Run the application event loop."""
+        return self.app.exec()
+
+
+def main() -> int:
+    """Main entry point for the desktop app."""
+    # Fix Windows console encoding for Unicode/emoji characters
+    # Only for non-frozen apps - frozen apps redirect stdout to crash log
+    if sys.platform == 'win32' and not getattr(sys, 'frozen', False):
+        try:
+            import io
+            # Only wrap if stdout has a proper binary buffer
+            if hasattr(sys.stdout, 'buffer') and hasattr(sys.stdout.buffer, 'write'):
+                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+            if hasattr(sys.stderr, 'buffer') and hasattr(sys.stderr.buffer, 'write'):
+                sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+    # Required for PyInstaller: must be called before any multiprocessing
+    # Without this, bundled apps can spawn infinite copies of themselves
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    # Single-instance check
+    # This prevents multiple tray icons and log windows from spawning
+    if not acquire_single_instance_lock():
+        print("⚠️ Another instance of Jarvis Desktop is already running.", flush=True)
+
+        # Create a minimal QApplication for the dialog
+        from PyQt6.QtWidgets import QApplication
+        temp_app = QApplication(sys.argv)
+
+        if show_instance_conflict_dialog():
+            # User wants to kill the existing instance
+            existing_pid = get_existing_instance_pid()
+            if existing_pid:
+                print(f"🔄 Closing existing instance (PID {existing_pid})...", flush=True)
+                if kill_existing_instance(existing_pid):
+                    # Wait a moment for the lock file to be released
+                    import time
+                    time.sleep(0.5)
+
+                    # Try to acquire the lock again
+                    if acquire_single_instance_lock():
+                        print("✅ Lock acquired, starting new instance...", flush=True)
+                        # Clean up temp app - we'll create the real one below
+                        temp_app.quit()
+                        del temp_app
+                    else:
+                        print("❌ Failed to acquire lock after killing existing instance.", flush=True)
+                        return 1
+                else:
+                    print("❌ Failed to close existing instance.", flush=True)
+                    return 1
+            else:
+                print("❌ Could not find existing instance PID.", flush=True)
+                return 1
+        else:
+            # User chose to exit
+            print("👋 Exiting.", flush=True)
+            return 0
+
+    # Check for previous crash BEFORE setting up new crash logging
+    # This way we can read the old crash log before it's overwritten
+    previous_crash = check_previous_crash()
+
+    # Set up crash logging for bundled apps
+    crash_log_file = setup_crash_logging()
+
+    # Mark that this session has started (for crash detection on next launch)
+    mark_session_started()
+
+    # Register clean exit handler
+    atexit.register(mark_session_clean_exit)
+
+    print("Starting Jarvis Desktop App...", flush=True)
+    print(f"Python executable: {sys.executable}", flush=True)
+    print(f"Working directory: {os.getcwd()}", flush=True)
+    print(f"__file__: {__file__}", flush=True)
+    print(flush=True)
+
+    # Set up signal handlers for clean shutdown
+    import signal
+    tray_instance = None
+
+    def signal_handler(signum, frame):
+        """Handle termination signals."""
+        print(f"Received signal {signum}, shutting down...", flush=True)
+        if tray_instance:
+            tray_instance.cleanup_on_exit()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        print("Creating QApplication...", flush=True)
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import QTimer
+        print("QApplication imported successfully", flush=True)
+
+        # Create QApplication first (needed for wizard and splash)
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(False)
+
+        # Show crash report dialog if previous session crashed
+        if previous_crash:
+            print("⚠️ Previous session crashed, showing crash report dialog...", flush=True)
+            show_crash_report_dialog(previous_crash)
+
+        # Show splash screen during startup
+        from desktop_app.splash_screen import SplashScreen
+        splash = SplashScreen()
+        splash.show()
+        splash.set_status("Initializing...")
+        app.processEvents()
+
+        # Check if setup wizard is needed
+        splash.set_status("Checking setup status...")
+        print("Checking Ollama setup status...", flush=True)
+        print("  Loading setup wizard module...", flush=True)
+        try:
+            from desktop_app.setup_wizard import (
+                should_show_setup_wizard, SetupWizard,
+                check_ollama_server, check_ollama_cli,
+                get_required_models, check_installed_models,
+                resolve_ollama_path,
+            )
+            print("  Setup wizard module loaded successfully", flush=True)
+        except Exception as e:
+            print(f"  ❌ Failed to load setup wizard: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+
+        # Run setup check in background thread to keep splash animation alive
+        from PyQt6.QtCore import QThread, pyqtSignal, QEventLoop
+
+        class SetupCheckWorker(QThread):
+            """Worker thread to check setup status without blocking UI."""
+            finished = pyqtSignal(bool)  # Emits True if setup wizard needed
+
+            def run(self):
+                try:
+                    result = should_show_setup_wizard()
+                    self.finished.emit(result)
+                except Exception as e:
+                    print(f"  ❌ Setup check failed: {e}", flush=True)
+                    # On error, show wizard to let user fix issues
+                    self.finished.emit(True)
+
+        setup_check_result = [None]  # Use list to allow modification in closure
+
+        def on_setup_check_done(needs_wizard: bool):
+            setup_check_result[0] = needs_wizard
+
+        worker = SetupCheckWorker()
+        worker.finished.connect(on_setup_check_done)
+        worker.start()
+
+        # Use QEventLoop to wait while keeping UI fully responsive
+        # This allows the splash animation to run smoothly
+        loop = QEventLoop()
+        worker.finished.connect(loop.quit)
+        loop.exec()
+
+        if setup_check_result[0]:
+            # Hide splash while wizard is shown
+            splash.hide()
+            print("🔧 Setup required - launching setup wizard...", flush=True)
+            wizard = SetupWizard()
+            # Ensure wizard is visible and has focus (prevents window manager issues)
+            wizard.show()
+            wizard.raise_()
+            wizard.activateWindow()
+            result = wizard.exec()
+
+            if result != wizard.DialogCode.Accepted:
+                print("Setup wizard cancelled - exiting", flush=True)
+                return 0
+
+            print("✅ Setup wizard completed successfully", flush=True)
+            # Show splash again after wizard
+            splash.show()
+            splash.set_status("Setup complete!")
+            app.processEvents()
+        else:
+            print("✅ Ollama setup looks good", flush=True)
+
+        # Even if setup was completed before, verify Ollama server is actually running
+        # This handles the case where user reinstalls or Ollama service isn't auto-started
+        splash.set_status("Checking Ollama server...")
+        app.processEvents()
+
+        # Run server check in background thread to keep splash animation alive
+        class ServerCheckWorker(QThread):
+            """Worker thread to check Ollama server status without blocking UI."""
+            finished = pyqtSignal(bool, object)  # Emits (is_running, version)
+
+            def run(self):
+                try:
+                    running, ver = check_ollama_server()
+                    self.finished.emit(running, ver)
+                except Exception as e:
+                    print(f"  ❌ Server check failed: {e}", flush=True)
+                    self.finished.emit(False, None)
+
+        server_check_result = [None, None]  # [is_running, version]
+
+        def on_server_check_done(running: bool, ver):
+            server_check_result[0] = running
+            server_check_result[1] = ver
+
+        server_worker = ServerCheckWorker()
+        server_worker.finished.connect(on_server_check_done)
+        server_worker.start()
+
+        # Use QEventLoop to wait while keeping UI fully responsive
+        server_loop = QEventLoop()
+        server_worker.finished.connect(server_loop.quit)
+        server_loop.exec()
+
+        is_running, version = server_check_result
+
+        if not is_running:
+            print("⚠️ Ollama server not running, attempting to start...", flush=True)
+            splash.set_status("Starting Ollama server...")
+            app.processEvents()
+
+            # Get ollama path
+            cli_installed, ollama_path = check_ollama_cli()
+            if not cli_installed:
+                ollama_path = "ollama"
+                print(f"  ⚠️ Ollama CLI not found in standard paths, trying '{ollama_path}' from PATH", flush=True)
+            else:
+                print(f"  📍 Found Ollama at: {ollama_path}", flush=True)
+
+            # Try to start Ollama server
+            ollama_process = None
+            try:
+                if sys.platform == "darwin":
+                    # On macOS, try to open the Ollama app first
+                    try:
+                        print("  🍎 Trying to open Ollama.app...", flush=True)
+                        ollama_process = subprocess.Popen(
+                            ["open", "-a", "Ollama"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                    except Exception as e:
+                        # Fall back to running serve command
+                        print(f"  ⚠️ Ollama.app not found ({e}), trying serve command...", flush=True)
+                        ollama_process = subprocess.Popen(
+                            [ollama_path, "serve"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True
+                        )
+                elif sys.platform == "win32":
+                    # On Windows, hide the console window
+                    print(f"  🪟 Starting Ollama server: {ollama_path} serve", flush=True)
+                    ollama_process = subprocess.Popen(
+                        [ollama_path, "serve"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                else:
+                    # On Linux and other platforms
+                    print(f"  🐧 Starting Ollama server: {ollama_path} serve", flush=True)
+                    ollama_process = subprocess.Popen(
+                        [ollama_path, "serve"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True
+                    )
+
+                # Verify the process started
+                if ollama_process and ollama_process.poll() is not None:
+                    print(f"  ❌ Ollama process exited immediately with code {ollama_process.returncode}", flush=True)
+                else:
+                    print(f"  ✅ Ollama process started (PID: {ollama_process.pid if ollama_process else 'unknown'})", flush=True)
+
+                # Wait for Ollama to start (up to 15 seconds)
+                splash.set_status("Waiting for Ollama to start...")
+                app.processEvents()
+
+                import time
+                max_wait = 15
+                wait_interval = 0.5
+                waited = 0
+                while waited < max_wait:
+                    # Use shorter sleeps with more frequent UI updates for smooth animation
+                    for _ in range(5):  # 5 x 100ms = 500ms total
+                        time.sleep(0.1)
+                        app.processEvents()
+                    waited += wait_interval
+
+                    is_running, version = check_ollama_server()
+                    if is_running:
+                        print(f"✅ Ollama server started (version {version})", flush=True)
+                        break
+
+                    # Update splash with progress
+                    splash.set_status(f"Waiting for Ollama to start... ({int(waited)}s)")
+                    app.processEvents()
+
+                if not is_running:
+                    print("⚠️ Ollama server failed to start within timeout", flush=True)
+                    # Don't block startup - daemon will handle connection errors
+            except Exception as e:
+                print(f"⚠️ Failed to start Ollama: {e}", flush=True)
+                # Continue anyway - user may start Ollama manually
+        else:
+            print(f"✅ Ollama server is running (version {version})", flush=True)
+
+        # Check for missing required models (important for users upgrading from older versions)
+        # This catches the case where server wasn't running at initial check but models are missing
+        splash.set_status("Verifying required models...")
+        app.processEvents()
+
+        required_models = get_required_models()
+        installed_models = check_installed_models(resolve_ollama_path())
+
+        # Normalize model names for comparison (remove :latest suffix)
+        def normalize_model(name: str) -> str:
+            return name.split(":")[0] if ":" in name and name.endswith(":latest") else name
+
+        installed_normalized = {normalize_model(m) for m in installed_models}
+        missing_models = [
+            m for m in required_models
+            if normalize_model(m) not in installed_normalized and m not in installed_models
+        ]
+
+        if missing_models:
+            splash.hide()
+            print(f"⚠️ Missing required models: {missing_models}", flush=True)
+            print("🔧 Opening setup wizard to install missing models...", flush=True)
+            wizard = SetupWizard()
+            wizard.show()
+            wizard.raise_()
+            wizard.activateWindow()
+            result = wizard.exec()
+
+            if result != wizard.DialogCode.Accepted:
+                print("Setup wizard cancelled - exiting", flush=True)
+                return 0
+
+            print("✅ Model installation complete", flush=True)
+            splash.show()
+            splash.set_status("Models installed!")
+            app.processEvents()
+        else:
+            print("✅ All required models are installed", flush=True)
+
+        # Check if user is using an unsupported model
+        splash.set_status("Checking model compatibility...")
+        unsupported_model = check_model_support()
+        if unsupported_model:
+            splash.hide()
+            print(f"⚠️ Unsupported model detected: {unsupported_model}", flush=True)
+            if show_unsupported_model_dialog(unsupported_model):
+                # User wants to open setup wizard
+                print("🔧 Opening setup wizard to change model...", flush=True)
+                wizard = SetupWizard()
+                wizard.show()
+                wizard.raise_()
+                wizard.activateWindow()
+                result = wizard.exec()
+                if result != wizard.DialogCode.Accepted:
+                    print("Setup wizard cancelled - exiting", flush=True)
+                    return 0
+            splash.show()
+            splash.set_status("Model check complete!")
+            app.processEvents()
+
+        splash.set_status("Loading Jarvis...")
+        print("Initializing JarvisSystemTray...", flush=True)
+        tray_instance = JarvisSystemTray()
+        print("JarvisSystemTray initialized successfully", flush=True)
+
+        # Always auto-start listening (logs will be shown via start_daemon)
+        splash.set_status("Starting voice assistant...")
+        print("🚀 Auto-starting Jarvis listener...", flush=True)
+        tray_instance.start_daemon()
+
+        # Close splash screen
+        splash.close_splash()
+
+        if crash_log_file:
+            # Show notification with log file location
+            from PyQt6.QtWidgets import QSystemTrayIcon
+            tray_instance.tray_icon.showMessage(
+                "Jarvis Started",
+                f"Crash logs available at:\n{crash_log_file}",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
+
+        print("Starting event loop...", flush=True)
+        return tray_instance.run()
+    except Exception as e:
+        error_msg = f"desktop app fatal error: {e}\n{traceback.format_exc()}"
+        print(error_msg, flush=True)
+        debug_log(error_msg, "desktop")
+
+        # Try to show an error dialog if possible
+        try:
+            from PyQt6.QtWidgets import QApplication, QMessageBox
+            if not QApplication.instance():
+                app = QApplication(sys.argv)
+
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("Jarvis Desktop App Error")
+            msg.setText("Failed to start Jarvis Desktop App")
+            msg.setDetailedText(str(e) + "\n\n" + traceback.format_exc())
+            if crash_log_file:
+                msg.setInformativeText(f"Check log file at:\n{crash_log_file}")
+            msg.exec()
+        except Exception:
+            # Can't show dialog, error is already logged
+            pass
+
+        return 1
+
+
+if __name__ == "__main__":
+    # Required for PyInstaller to handle multiprocessing correctly
+    # Without this, bundled apps spawn infinite copies of themselves
+    import multiprocessing
+    multiprocessing.freeze_support()
+    sys.exit(main())
+

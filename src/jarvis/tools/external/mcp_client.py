@@ -1,0 +1,338 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import shutil
+from typing import Any, Dict, Optional, List
+from contextlib import asynccontextmanager
+
+from mcp import ClientSession  # type: ignore
+from mcp.client.stdio import stdio_client, StdioServerParameters  # type: ignore
+
+
+import glob as _glob
+import shlex as _shlex
+import sys as _sys
+
+
+class MCPServerSessionError(RuntimeError):
+    """Raised when a stateful MCP server's session has been lost.
+
+    Public, stable type that callers can catch to distinguish a
+    transient session failure (subprocess crashed, idle timeout
+    elapsed mid-call) from a tool-level error returned by ``call_tool``.
+    The persistent runtime retries once internally before this surfaces
+    to ``MCPClient`` callers.
+    """
+
+# Static directories to search when a command isn't on the daemon's PATH.
+# macOS GUI-launched processes often miss Homebrew, nvm, fnm, and Volta paths.
+_EXTRA_PATH_DIRS: List[str] = [
+    "/opt/homebrew/bin",           # Homebrew (Apple Silicon)
+    "/usr/local/bin",              # Homebrew (Intel) / manual installs
+    os.path.expanduser("~/.volta/bin"),             # Volta
+    os.path.expanduser("~/.local/bin"),             # pipx / uvx
+]
+
+# Glob patterns for version-managed directories (nvm, fnm).
+# Sorted in reverse so the highest version is preferred.
+_EXTRA_PATH_GLOBS: List[str] = [
+    os.path.expanduser("~/.nvm/versions/node/*/bin"),   # nvm
+    os.path.expanduser("~/.fnm/node-versions/*/installation/bin"),  # fnm
+]
+
+
+def _get_user_shell() -> str:
+    """Return the user's login shell, falling back to /bin/bash."""
+    return os.environ.get("SHELL", "/bin/bash")
+
+
+def _resolve_command(command: str) -> str:
+    """Resolve a command name to an absolute path.
+
+    First checks the current PATH via ``shutil.which``.  If that fails,
+    probes a list of common directories that GUI-launched daemons on macOS
+    typically miss (Homebrew, nvm, fnm, Volta, etc.).  As a final fallback,
+    spawns the user's login shell to resolve the command.
+
+    Returns the resolved absolute path, or raises ``FileNotFoundError``.
+    """
+    # Already absolute — just verify it exists
+    if os.path.isabs(command):
+        if os.path.isfile(command):
+            return command
+        raise FileNotFoundError(f"MCP server command does not exist: {command}")
+
+    # Try standard PATH first
+    found = shutil.which(command)
+    if found:
+        return found
+
+    # Probe static extra directories
+    for d in _EXTRA_PATH_DIRS:
+        candidate = os.path.join(d, command)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    # Probe version-managed directories (nvm, fnm) — prefer highest version
+    for pattern in _EXTRA_PATH_GLOBS:
+        dirs = sorted(_glob.glob(pattern), reverse=True)
+        for d in dirs:
+            candidate = os.path.join(d, command)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+
+    # Fallback: ask the user's login shell (catches all custom PATH additions)
+    if _sys.platform != "win32":
+        try:
+            import subprocess
+            shell = _get_user_shell()
+            # Quote the command so shell metacharacters in a misconfigured
+            # ``mcps[*].command`` cannot inject extra commands into the
+            # login shell. Defensive — config is user-owned, but keeping
+            # the value safe for any path that touches a shell is cheap.
+            result = subprocess.run(
+                [shell, "-lc", f"which {_shlex.quote(command)}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+
+    raise FileNotFoundError(
+        f"MCP server command not found on PATH: {command}. "
+        "Ensure Node.js and npx are installed and available."
+    )
+
+
+class _StdioConnection:
+    """Async context manager that wraps a ``stdio_client`` session AND
+    owns the ``/dev/null`` file used to suppress the MCP server's stderr.
+
+    The wrapped context manager is built synchronously by
+    ``MCPClient._connect_stdio`` so existing call sites and tests that
+    construct a connection eagerly continue to work. The wrapper's job
+    is to close the devnull handle when the async context exits,
+    regardless of how the inner context terminates. Without this the
+    devnull handle leaked once per ``_session`` call (i.e. every MCP
+    tool invocation), eventually exhausting the process FD limit on
+    long-running daemons.
+    """
+
+    def __init__(self, inner_cm, errlog) -> None:
+        self._cm = inner_cm
+        self._errlog = errlog
+
+    async def __aenter__(self):
+        return await self._cm.__aenter__()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            return await self._cm.__aexit__(exc_type, exc, tb)
+        finally:
+            try:
+                self._errlog.close()
+            except Exception:
+                pass
+
+
+class MCPClient:
+    """Lightweight manager to connect to external MCP servers and call tools."""
+
+    def __init__(self, mcps_config: Dict[str, Any]) -> None:
+        self.server_configs: Dict[str, Dict[str, Any]] = mcps_config or {}
+
+    def _connect_stdio(self, server_cfg: Dict[str, Any]):
+        """Build an async context manager for the stdio transport.
+
+        Returns an ``_StdioConnection`` that owns both the stdio_client
+        session and the ``/dev/null`` handle used to silence the server
+        subprocess's stderr. Path resolution and PATH injection happen
+        synchronously here so any ``FileNotFoundError`` surfaces at the
+        call site, before the ``async with`` block.
+        """
+        command = str(server_cfg.get("command"))
+        # Windows compatibility: prefer npx.cmd when requested
+        if os.name == "nt" and command.lower() == "npx":
+            command = "npx.cmd"
+        # Resolve command to an absolute path
+        command = _resolve_command(command)
+        # Expand user (~) in args for filesystem paths
+        raw_args = server_cfg.get("args") or []
+        args = [os.path.expanduser(str(a)) if isinstance(a, str) else a for a in raw_args]
+        user_env = server_cfg.get("env") or {}
+        # Ensure the resolved command's directory is on PATH so that
+        # shebangs like #!/usr/bin/env node can find sibling binaries.
+        # We must pass the full environment because StdioServerParameters
+        # replaces (not merges) the parent env when env is not None.
+        cmd_dir = os.path.dirname(command)
+        current_path = os.environ.get("PATH", "")
+        if cmd_dir and cmd_dir not in current_path.split(os.pathsep):
+            env = {**os.environ, **user_env, "PATH": cmd_dir + os.pathsep + current_path}
+        elif user_env:
+            env = {**os.environ, **user_env}
+        else:
+            env = None  # inherit parent env as-is
+        params = StdioServerParameters(command=command, args=args, env=env)
+        # Suppress MCP server stderr noise (npm warnings, usage banners, etc.)
+        # from polluting the daemon's log output.
+        # Must use a real file (not StringIO) because the subprocess needs fileno().
+        devnull = open(os.devnull, "w")
+        # Build the underlying transport CM eagerly so any synchronous
+        # construction error closes devnull instead of leaking it. The
+        # wrapper guarantees the handle is also closed on every async
+        # exit path — this is the actual leak fix.
+        try:
+            inner = stdio_client(params, errlog=devnull)
+        except Exception:
+            devnull.close()
+            raise
+        return _StdioConnection(inner, errlog=devnull)
+
+    @asynccontextmanager
+    async def _session(self, server_name: str):
+        cfg = self.server_configs.get(server_name)
+        if not cfg:
+            raise ValueError(f"Unknown MCP server '{server_name}'. Check config.mcps.")
+        transport = str(cfg.get("transport") or "stdio").lower()
+        if transport != "stdio":
+            raise NotImplementedError(f"Unsupported MCP transport '{transport}'. Only 'stdio' is supported currently.")
+
+        async with self._connect_stdio(cfg) as (read, write):
+            # Disable anyio TaskGroup cancellation propagation issues by scoping session strictly here
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                try:
+                    yield session
+                finally:
+                    # Let nested contexts handle their own shutdown cleanly
+                    pass
+
+    async def list_tools_async(self, server_name: str) -> List[Dict[str, Any]]:
+        async with self._session(server_name) as session:
+            tools_result = await session.list_tools()
+            # Extract tools from the ListToolsResult object
+            tools_list = getattr(tools_result, "tools", tools_result) if hasattr(tools_result, "tools") else tools_result
+            
+            result = []
+            for t in tools_list:
+                # Handle Tool objects with attributes
+                tool_info = {
+                    "name": getattr(t, "name", None),
+                    "description": getattr(t, "description", None),
+                    "inputSchema": getattr(t, "inputSchema", None),
+                }
+                result.append(tool_info)
+            return result
+
+    async def invoke_tool_async(self, server_name: str, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        async with self._session(server_name) as session:
+            res = await session.call_tool(tool_name, arguments or {})
+            return _result_to_dict(res)
+
+    # Convenience sync wrappers
+    def list_tools(self, server_name: str) -> List[Dict[str, Any]]:
+        """Discover tools from the named server.
+
+        Routes through the persistent MCP runtime so the same stdio
+        session that services discovery also services subsequent
+        ``invoke_tool`` calls — avoids paying subprocess startup twice.
+        """
+        cfg = self._require_stdio_cfg(server_name)
+        from .mcp_runtime import get_runtime, _WorkerDeadError
+
+        runtime = get_runtime()
+        try:
+            res = runtime.list_tools(server_name, cfg)
+        except _WorkerDeadError as e:
+            raise MCPServerSessionError(str(e)) from e
+
+        tools_list = getattr(res, "tools", res) if hasattr(res, "tools") else res
+        result: List[Dict[str, Any]] = []
+        for t in tools_list:
+            result.append(
+                {
+                    "name": getattr(t, "name", None),
+                    "description": getattr(t, "description", None),
+                    "inputSchema": getattr(t, "inputSchema", None),
+                }
+            )
+        return result
+
+    def invoke_tool(self, server_name: str, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Invoke a tool against the named server.
+
+        Routes through the persistent MCP runtime so the server's stdio
+        session stays alive across calls. Stateful servers (e.g.
+        chrome-devtools-mcp, which owns a Chrome process) cannot survive
+        the one-shot ``asyncio.run`` pattern: tearing down the session
+        kills the subprocess and any children it launched.
+
+        On a transient session loss (subprocess died, idle timeout
+        elapsed mid-call) the runtime retries once with a fresh worker.
+        If that retry also fails, a ``MCPServerSessionError`` propagates;
+        callers can distinguish that from tool-level errors carried in
+        the returned dict's ``isError`` field.
+        """
+        cfg = self._require_stdio_cfg(server_name)
+        from .mcp_runtime import get_runtime, _WorkerDeadError
+
+        runtime = get_runtime()
+        try:
+            res = runtime.invoke(server_name, cfg, tool_name, arguments)
+        except _WorkerDeadError as e:
+            raise MCPServerSessionError(str(e)) from e
+        return _result_to_dict(res)
+
+    def _require_stdio_cfg(self, server_name: str) -> Dict[str, Any]:
+        """Return the server config, validating presence and transport."""
+        cfg = self.server_configs.get(server_name)
+        if not cfg:
+            raise ValueError(
+                f"Unknown MCP server '{server_name}'. Check config.mcps."
+            )
+        transport = str(cfg.get("transport") or "stdio").lower()
+        if transport != "stdio":
+            raise NotImplementedError(
+                f"Unsupported MCP transport '{transport}'. Only 'stdio' is supported currently."
+            )
+        return cfg
+
+
+def _result_to_dict(res: Any) -> Dict[str, Any]:
+    """Convert an MCP ``call_tool`` response object to the internal dict shape."""
+    raw_content = getattr(res, "content", None)
+    is_error = getattr(res, "isError", False)
+    meta = getattr(res, "meta", None)
+    return {
+        "content": raw_content,
+        "text": _flatten_content(raw_content),
+        "isError": is_error,
+        "meta": meta,
+    }
+
+
+def _flatten_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [_flatten_content(item) for item in content]
+        return "\n".join([p for p in parts if p])
+    if isinstance(content, dict):
+        if "text" in content:
+            return str(content.get("text") or "")
+        if content.get("type") == "text" and "data" in content:
+            return str(content.get("data") or "")
+        try:
+            return str(content)
+        except Exception:
+            return ""
+    try:
+        return str(content)
+    except Exception:
+        return ""
+
+
