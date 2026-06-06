@@ -245,7 +245,7 @@ Sistema de conexión con herramientas externas.
 # 📂 Estructura del proyecto
 
 ```bash
-Jarvis/
+AsistenteIAPrivadoJARVIS/
 │
 ├── src/
 │   ├── agent/
@@ -295,7 +295,7 @@ Jarvis/
 ## 1️⃣ Clonar repositorio
 
 ```bash
-git clone https://github.com/isairey/jarvis.git
+git clone https://github.com/isairey/AsistenteIAPrivadoJARVIS.git
 ```
 
 ---
@@ -303,7 +303,7 @@ git clone https://github.com/isairey/jarvis.git
 ## 2️⃣ Entrar al proyecto
 
 ```bash
-cd jarvis
+cd AsistenteIAPrivadoJARVIS
 ```
 
 ---
